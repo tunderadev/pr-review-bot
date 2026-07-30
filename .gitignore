@@ -1,0 +1,23 @@
+# Superpowers working docs — specs/plans are local-only, never committed
+docs/superpowers/
+
+# Secrets — never commit. Resolved from ~/.config/pr-review-bot/.env or exported env vars.
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.private-key
+
+# Team-owned config. Lives in the team's own repo or config dir, not here.
+config/team.json
+config/team.*.json
+!config/team.example.json
+criteria/review-criteria.md
+!criteria/review-criteria.example.md
+
+# Opt-in telemetry output
+*.jsonl
+
+node_modules/
+.DS_Store

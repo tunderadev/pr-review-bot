@@ -1,0 +1,9 @@
+{
+  "name": "pr-review-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "bin": { "pr-review-bot": "./src/cli.mjs" },
+  "scripts": { "test": "node --test test/" }
+}

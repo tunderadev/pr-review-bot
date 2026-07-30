@@ -1,0 +1,20 @@
+{
+  "team": "platform",
+  "owner": "octocat",
+  "repos": ["octocat/storefront"],
+  "titlePrefix": "^\\[PLAT\\]",
+  "labels": {
+    "requested": "review-requested",
+    "inProgress": "review-in-progress",
+    "error": "review-error"
+  },
+  "slack": {
+    "channel": "C0123ABC",
+    "emoji": { "inReview": "eyes", "approved": "white_check_mark", "changesRequested": "x" }
+  },
+  "authorMap": { "octocat": "U0123ABC" },
+  "maxPerCycle": 3,
+  "maxDiffLines": 3000,
+  "depth": "standard",
+  "telemetry": false
+}

@@ -42,7 +42,7 @@ export function assertNoSecrets(raw, path = '') {
 
 export function validateConfig(raw) {
   const problems = []
-  for (const key of ['owner', 'repos', 'titlePrefix', 'slack']) {
+  for (const key of ['team', 'owner', 'repos', 'titlePrefix', 'slack']) {
     if (raw[key] === undefined) problems.push(`missing required key "${key}"`)
   }
   if (raw.repos !== undefined && (!Array.isArray(raw.repos) || raw.repos.length === 0)) {

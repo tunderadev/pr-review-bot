@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveConfigDir, validateConfig, assertNoSecrets, CONFIG_FILENAME } from '../src/config.mjs'
+import { resolveConfigDir, validateConfig, assertNoSecrets, loadConfig, CONFIG_FILENAME, CRITERIA_FILENAME } from '../src/config.mjs'
 
 const VALID = {
   team: 'platform',
@@ -51,8 +51,8 @@ test('validateConfig applies defaults without inventing a model', () => {
 
 test('validateConfig reports every problem at once', () => {
   assert.throws(
-    () => validateConfig({ team: 'x' }),
-    (e) => e.message.includes('owner') && e.message.includes('repos') && e.message.includes('titlePrefix')
+    () => validateConfig({ owner: 'x' }),
+    (e) => e.message.includes('team') && e.message.includes('repos') && e.message.includes('titlePrefix')
   )
 })
 
@@ -68,4 +68,17 @@ test('assertNoSecrets rejects token-shaped values and secret-shaped keys', () =>
   assert.throws(() => assertNoSecrets({ ...VALID, slackBotToken: 'xoxb-' + '1-2-abc' }), /slackBotToken/)
   assert.throws(() => assertNoSecrets({ ...VALID, nested: { deep: 'ghp_aaaaaaaaaaaa' } }), /nested\.deep/)
   assert.doesNotThrow(() => assertNoSecrets(VALID))
+})
+
+test('loadConfig reads files, validates, and attaches criteria and configDir', () => {
+  const mockReadFile = (path) => {
+    if (path.endsWith(CONFIG_FILENAME)) return JSON.stringify(VALID)
+    if (path.endsWith(CRITERIA_FILENAME)) return '# Review Criteria\n\nCheck for X and Y'
+    throw new Error(`Unexpected path: ${path}`)
+  }
+  const config = loadConfig('/config/dir', { readFile: mockReadFile })
+  assert.equal(config.team, 'platform')
+  assert.equal(config.owner, 'octocat')
+  assert.equal(config.criteria, '# Review Criteria\n\nCheck for X and Y')
+  assert.equal(config.configDir, '/config/dir')
 })

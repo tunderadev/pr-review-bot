@@ -49,10 +49,15 @@ test('validateConfig applies defaults without inventing a model', () => {
   assert.ok(!('model' in c), 'model must not be defaulted')
 })
 
+test('validateConfig requires team', () => {
+  const { team, ...withoutTeam } = VALID
+  assert.throws(() => validateConfig(withoutTeam), /missing required key "team"/)
+})
+
 test('validateConfig reports every problem at once', () => {
   assert.throws(
     () => validateConfig({ owner: 'x' }),
-    (e) => e.message.includes('team') && e.message.includes('repos') && e.message.includes('titlePrefix')
+    (e) => e.message.includes('missing required key "repos"') && e.message.includes('missing required key "titlePrefix"')
   )
 })
 

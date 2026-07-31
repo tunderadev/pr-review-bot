@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { parseState, renderStateComment, findSticky, appendRound, alreadyReviewedSha, emptyState, lastRound, STATE_VERSION } from '../src/state.mjs'
 
 const state = {
@@ -138,31 +139,64 @@ test('parseState returns null for an unknown version inside a well-formed block'
 const block = (payloadObject) =>
   `<!-- pr-review-bot:state\n${Buffer.from(JSON.stringify(payloadObject)).toString('base64')}\n-->`
 
-test('parseState reads the FIRST decodable block, so an appended one cannot take over', () => {
-  // Anyone who can edit the sticky comment can append a block of their own.
-  // Reading the last one lets it replace the bot's own memory: a forged Slack
-  // binding redirects every future update into a channel of their choosing.
-  const forged = { version: STATE_VERSION, slack: { channel: 'ATTACKER', ts: '1.1' }, criteriaVersion: null, rounds: [] }
-  const body = `${renderStateComment(state)}\n\n${block(forged)}`
-  assert.deepEqual(parseState(body), state, 'the bot-written block comes first and must win')
+// Position is not a trust signal. The sticky comment is editable by anyone with
+// write access, so a second block can be put ABOVE or BELOW the bot's own.
+// Four parsers each picked a position — indexOf, lastIndexOf, newest-first,
+// oldest-first — and each one only moved the hole to the other end of the body.
+// When two blocks both decode there is no evidence which one the bot wrote, so
+// the parser refuses to guess and the caller heals from emptyState().
+const FORGED = {
+  version: STATE_VERSION,
+  slack: { channel: 'ATTACKER', ts: '1.1', stateEmoji: 'eyes' },
+  criteriaVersion: null,
+  rounds: [],
+}
+
+// Each of these is a paste a human could plausibly make — and each one still
+// decodes, because \s is inside the base64 character class. Only "> " quoting
+// escapes the alphabet, which is why quoting stays free and indenting does not.
+const PASTE_STYLES = [
+  ['raw', (text) => text],
+  ['inside a ``` fence', (text) => `\`\`\`\n${text}\n\`\`\``],
+  ['indented four spaces', (text) => text.split('\n').map((line) => `    ${line}`).join('\n')],
+  ['tab-indented', (text) => text.split('\n').map((line) => `\t${line}`).join('\n')],
+]
+
+for (const [how, style] of PASTE_STYLES) {
+  test(`a forged block ${how} ABOVE the real one wins nothing`, () => {
+    const body = `${style(renderStateComment(FORGED))}\n\n${renderStateComment(state)}`
+    assert.equal(parseState(body), null, 'two decodable blocks are ambiguous — heal from emptyState instead of picking one')
+  })
+}
+
+test('a forged block appended BELOW the real one wins nothing', () => {
+  // A forged Slack binding redirects every future update into a channel of the
+  // attacker's choosing, so adopting it is strictly worse than forgetting.
+  const body = `${renderStateComment(state)}\n\n${block(FORGED)}`
+  assert.equal(parseState(body), null)
 })
 
-test('re-pasting an older sticky body below the current one does not roll history back', () => {
-  // Rolling back to round 1 makes the bot re-announce and re-review work it
-  // has already reviewed, at the author's expense.
+test('re-pasting an older sticky body, above or below, does not roll history back', () => {
+  // Rolling back to round 1 makes the bot re-announce and re-review work it has
+  // already reviewed, at the author's expense. Refusing both arrangements is
+  // what makes the answer independent of where the copy landed.
   const older = { ...state, rounds: state.rounds.slice(0, 1) }
   const newer = appendRound(older, { sha: 'def5678', verdict: 'approved', at: '2026-07-29T20:00:00Z', blockers: [] })
-  const body = `${renderStateComment(newer)}\n\n---\nFor reference, the previous version of this comment:\n\n${renderStateComment(older)}`
-  assert.deepEqual(parseState(body), newer)
-  assert.equal(parseState(body).rounds.length, 2)
+  const reference = '\n\n---\nFor reference, the previous version of this comment:\n\n'
+  assert.equal(parseState(`${renderStateComment(newer)}${reference}${renderStateComment(older)}`), null, 'older copy below')
+  assert.equal(parseState(`${renderStateComment(older)}${reference}${renderStateComment(newer)}`), null, 'older copy above')
 })
 
 test('a corrupted real block returns null rather than falling back to another block', () => {
   // Healing from emptyState is recoverable; adopting someone else's state is not.
+  // A block that is base64 but decodes to nothing valid is the bot's own memory
+  // damaged or a forgery — either way the body has stopped being trustworthy,
+  // so a second block that DOES decode must not inherit its authority.
   const real = renderStateComment(state)
   const corrupted = real.slice(0, real.length - 12) + '\n-->'
-  const body = `${QUOTED_BLOCK}\n\n${corrupted}`
-  assert.equal(parseState(body), null)
+  assert.equal(parseState(`${QUOTED_BLOCK}\n\n${corrupted}`), null, 'quoted copy present')
+  assert.equal(parseState(`${block(FORGED)}\n\n${corrupted}`), null, 'raw forged block above')
+  assert.equal(parseState(`${corrupted}\n\n${block(FORGED)}`), null, 'raw forged block below')
 })
 
 test('parseState returns null for a version-correct payload of the wrong shape', () => {
@@ -190,4 +224,23 @@ test('parseState returns null for a version-correct payload of the wrong shape',
 test('a shape-valid payload still round-trips, including a state with no rounds', () => {
   assert.deepEqual(parseState(renderStateComment(emptyState())), emptyState())
   assert.deepEqual(parseState(renderStateComment(OTHER_STATE)), OTHER_STATE)
+})
+
+// A scan that advances non-monotonically does not fail this suite — it HANGS
+// it, and a hang is the one failure the runner cannot report: an in-process
+// timeout never fires because the synchronous loop owns the event loop. So the
+// parse runs in a child process, where a timeout can actually kill it.
+test('parseState terminates on a marker-dense body', () => {
+  const stateModule = new URL('../src/state.mjs', import.meta.url).href
+  const script = `
+    const { parseState } = await import(${JSON.stringify(stateModule)})
+    const marker = '<!-- pr-review-bot:state'
+    parseState((marker + '\\nAAAA\\n-->\\n').repeat(500))
+    parseState(marker.repeat(500))
+    parseState(marker + '-->'.repeat(500))
+    parseState(('a' + marker).repeat(500) + '-->')
+  `
+  const run = spawnSync(process.execPath, ['--input-type=module', '--eval', script], { encoding: 'utf8', timeout: 10_000 })
+  assert.equal(run.signal, null, `parseState did not terminate (killed by ${run.signal})`)
+  assert.equal(run.status, 0, `child exited ${run.status}: ${run.stderr}`)
 })

@@ -58,38 +58,61 @@ function isValidState(parsed) {
   return parsed.rounds.every((r) => isObject(r) && typeof r.sha === 'string' && Array.isArray(r.blockers))
 }
 
-function decodeBlock(segment) {
+// "Did not decode" is two different facts and they carry opposite weight.
+//
+// NOT_A_CANDIDATE: the payload is outside base64's alphabet. That is exactly
+// what a "> "-quoted copy of a real block looks like, and quoting a sticky
+// comment has to stay free — so these are ignored entirely.
+//
+// SUSPECT: the payload IS base64 but yields no valid state. Either the bot's
+// own block is damaged or someone wrote a block of their own. Nothing else in
+// the body can be trusted to be the bot's memory after that, so a SUSPECT
+// block poisons the whole parse rather than being skipped over.
+const NOT_A_CANDIDATE = Symbol('not-a-candidate')
+const SUSPECT = Symbol('suspect')
+
+function classifyBlock(segment) {
   const payload = segment.trim()
-  if (!payload || !BASE64_ONLY.test(payload)) return null
+  if (!payload || !BASE64_ONLY.test(payload)) return NOT_A_CANDIDATE
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'))
     // Unknown versions are healed by rebuilding rather than guessed at.
-    return isValidState(parsed) ? parsed : null
+    return isValidState(parsed) ? { state: parsed } : SUSPECT
   } catch {
-    return null
+    return SUSPECT
   }
 }
 
 export function parseState(body) {
   if (typeof body !== 'string') return null
-  // Markers can appear outside the real block on either side of it — a human
-  // quoting an older sticky comment, or appending a note of their own. Scan
-  // OLDEST-first: the bot writes its block last in the body it renders, so the
-  // first block in an edited comment is the bot's own. Reading the newest
-  // instead lets anything appended below win — a forged Slack binding, or a
-  // re-pasted older copy that rolls the round history back and re-reviews.
-  // A quoted copy appearing BEFORE the real block is rejected by BASE64_ONLY,
-  // not by ordering.
-  let start = body.indexOf(MARKER)
-  while (start !== -1) {
-    const end = body.indexOf(END, start + MARKER.length)
-    if (end !== -1) {
-      const state = decodeBlock(body.slice(start + MARKER.length, end))
-      if (state) return state
-    }
-    start = body.indexOf(MARKER, start + MARKER.length)
+  // Position is not a trust signal. The sticky comment is editable by anyone
+  // with write access, so a second block can be placed above or below the
+  // bot's own — indented, fenced, or raw, all of which still decode because
+  // \s is inside the base64 alphabet. Four parsers each picked a position
+  // (first, last, newest-first, oldest-first) and each only moved the hole to
+  // the other end of the body. So this one does not choose: it reads the whole
+  // body and answers only when the answer is unambiguous. One decodable block
+  // and no damaged ones is the only arrangement the bot itself ever writes;
+  // anything else returns null and the caller heals from emptyState(), which
+  // costs a re-announce and is undone by the head-SHA check, where adopting a
+  // forged Slack binding is not undone by anything.
+  //
+  // split() rather than an index scan: a scan whose advance stops being
+  // monotonic HANGS the process, and a hang is the one failure this suite
+  // cannot report. Iterating a fixed array cannot loop forever however it is
+  // later edited. Every segment after the first begins just past a marker.
+  let found = null
+  for (const segment of body.split(MARKER).slice(1)) {
+    const end = segment.indexOf(END)
+    // An unterminated marker carries no payload at all: nothing to adopt and
+    // nothing to doubt.
+    if (end === -1) continue
+    const block = classifyBlock(segment.slice(0, end))
+    if (block === NOT_A_CANDIDATE) continue
+    if (block === SUSPECT || found) return null
+    found = block.state
   }
-  return null
+  return found
 }
 
 export function findSticky(comments, botLogin) {

@@ -147,3 +147,180 @@ test('fetches the PR head through the default refs/pull ref, into a reused clone
   assert.match(readFileSync(join(wt.dir, 'hotfix.js'), 'utf8'), /fixed = true/)
   await wt.cleanup()
 })
+
+// ---------------------------------------------------------------------------
+// Hardening: this tool runs unattended on a timer, authenticating with a GitHub
+// App installation token that expires after one hour.
+// ---------------------------------------------------------------------------
+
+const refsIn = (cloneDir) =>
+  execFileSync('git', ['-C', cloneDir, 'for-each-ref', '--format=%(refname)', 'refs/pr-review-bot/'], { encoding: 'utf8' }).trim()
+
+const cloneDirFor = (clonesDir, repo) => join(clonesDir, repo.replace('/', '__'))
+
+// A token in the clone URL is written into .git/config and stays there: stale
+// within the hour, and sitting two directories above the worktree that headless
+// Claude runs in with Read and Grep. The remote must stay credential-free while
+// the credential is supplied per invocation.
+test('no credential is written into the clone, on the first call or a reused one', async () => {
+  const origin = makeOrigin()
+  const clonesDir = tempDir('clones-')
+  const checkouts = createCheckouts({
+    clonesDir,
+    remoteUrlFor: () => origin.dir,
+    credentialFor: () => 'x-access-token:ghs_SECRETTOKENVALUE',
+  })
+
+  const first = await checkouts.worktreeForPr({ repo: 'o/r', number: 1, sha: origin.sha, fetchRef: 'refs/heads/main' })
+  await first.cleanup()
+  // Round 2 on the reused clone: a fetch must not persist anything either.
+  const second = await checkouts.worktreeForPr({ repo: 'o/r', number: 2, sha: origin.sha, fetchRef: 'refs/heads/main' })
+  await second.cleanup()
+
+  const cloneDir = cloneDirFor(clonesDir, 'o/r')
+  const config = readFileSync(join(cloneDir, '.git', 'config'), 'utf8')
+  assert.equal(config.includes('ghs_SECRETTOKENVALUE'), false, 'the token must never reach .git/config')
+  assert.equal(/extraheader/i.test(config), false, 'no persisted auth header either')
+  const storedUrl = execFileSync('git', ['-C', cloneDir, 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim()
+  assert.equal(storedUrl, origin.dir, 'the stored remote must be the credential-free URL')
+})
+
+// runGit is injected here deliberately: this is about what the module HANDS to
+// git, which no amount of real-git observation offline can show.
+function recordingCheckouts(overrides = {}) {
+  const calls = []
+  const checkouts = createCheckouts({
+    clonesDir: tempDir('clones-'),
+    runGit: async (args, cwd, opts = {}) => {
+      calls.push({ args, cwd, ...opts })
+      return ''
+    },
+    ...overrides,
+  })
+  return { calls, checkouts }
+}
+
+test('every git invocation carries a freshly minted credential, in the env and never in argv', async () => {
+  const minted = []
+  const { calls, checkouts } = recordingCheckouts({
+    // Task 13's natural move: embed the current installation token in the URL.
+    remoteUrlFor: (repo) => {
+      const token = `ghs_TOKEN${minted.length}`
+      minted.push(token)
+      return `https://x-access-token:${token}@github.com/${repo}.git`
+    },
+  })
+
+  await checkouts.worktreeForPr({ repo: 'o/r', number: 1, sha: 'a'.repeat(40) })
+  const afterFirst = minted.length
+  await checkouts.worktreeForPr({ repo: 'o/r', number: 2, sha: 'b'.repeat(40) })
+
+  assert.equal(afterFirst, 1, 'the URL must be requested once per invocation')
+  assert.equal(minted.length, 2, 'a second review must mint a second token, not reuse the clone-time one')
+
+  for (const call of calls) {
+    assert.equal(
+      call.args.some((arg) => String(arg).includes('ghs_')),
+      false,
+      `credential leaked into argv: ${JSON.stringify(call.args)}`
+    )
+  }
+  const header = (token) => `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`
+  const fetches = calls.filter((c) => c.args[0] === 'fetch')
+  assert.equal(fetches.length, 2)
+  assert.equal(fetches[0].env.GIT_CONFIG_VALUE_0, header('ghs_TOKEN0'))
+  assert.equal(fetches[1].env.GIT_CONFIG_VALUE_0, header('ghs_TOKEN1'), 'the second fetch must use the second token')
+  const cloneCall = calls.find((c) => c.args[0] === 'clone')
+  assert.ok(cloneCall.args.includes('https://github.com/o/r.git'), 'clone must be handed the credential-free URL')
+})
+
+test('git runs non-interactively, under a wall-clock timeout the caller can set', async () => {
+  const { calls, checkouts } = recordingCheckouts({ remoteUrlFor: () => 'https://github.com/o/r.git' })
+  await checkouts.worktreeForPr({ repo: 'o/r', number: 1, sha: 'a'.repeat(40) })
+
+  assert.ok(calls.length > 0)
+  for (const call of calls) {
+    assert.equal(call.env.GIT_TERMINAL_PROMPT, '0', `interactive prompt left enabled for ${call.args[0]}`)
+    assert.equal(call.env.GIT_ASKPASS, '', `askpass dialog left enabled for ${call.args[0]}`)
+    assert.equal(call.env.SSH_ASKPASS, '', `ssh askpass dialog left enabled for ${call.args[0]}`)
+    assert.match(call.env.GIT_SSH_COMMAND, /BatchMode=yes/, `ssh could still prompt for ${call.args[0]}`)
+    assert.ok(call.timeoutMs > 0, `no timeout on ${call.args[0]}`)
+  }
+
+  const custom = recordingCheckouts({ remoteUrlFor: () => 'https://github.com/o/r.git', gitTimeoutMs: 1234 })
+  await custom.checkouts.worktreeForPr({ repo: 'o/r', number: 1, sha: 'a'.repeat(40) })
+  assert.deepEqual([...new Set(custom.calls.map((c) => c.timeoutMs))], [1234], 'caller timeout must reach every call')
+})
+
+// The timeout is only real if the DEFAULT runGit wires it into execFile. Asserting
+// what the module passes proves nothing about that, and this module's whole job
+// is done by the default runGit.
+test('the default runGit actually enforces the timeout instead of stalling', async () => {
+  const origin = makeOrigin()
+  const clonesDir = tempDir('clones-')
+  const checkouts = createCheckouts({ clonesDir, remoteUrlFor: () => origin.dir, gitTimeoutMs: 1 })
+  const err = await checkouts
+    .worktreeForPr({ repo: 'o/r', number: 1, sha: origin.sha, fetchRef: 'refs/heads/main' })
+    .then(() => null, (e) => e)
+  assert.ok(err, 'a 1ms budget must not complete a clone')
+  assert.equal(err.killed, true, `git should have been killed, got: ${err.message}`)
+})
+
+// A killed review never runs cleanup(). Its worktree directory, its registration
+// inside .git/worktrees, and its refs/pr-review-bot ref all survive, and they
+// accumulate one set per crash for as long as the clone lives.
+test('a crashed review leaves no stale worktree registration or ref behind', async () => {
+  const origin = makeOrigin()
+  const git = (...a) => execFileSync('git', ['-C', origin.dir, ...a], { stdio: 'pipe' })
+  writeFileSync(join(origin.dir, 'app.js'), 'export const answer = 99\n')
+  git('add', '.')
+  git('commit', '-qm', 'second')
+  const tipSha = execFileSync('git', ['-C', origin.dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+
+  const clonesDir = tempDir('clones-')
+  const checkouts = createCheckouts({ clonesDir, remoteUrlFor: () => origin.dir })
+  const cloneDir = cloneDirFor(clonesDir, 'o/r')
+
+  const crashed = await checkouts.worktreeForPr({ repo: 'o/r', number: 5, sha: origin.sha, fetchRef: 'refs/heads/main' })
+  // The crash: the process is killed, so cleanup() never runs and the worktree
+  // is left exactly as it was — directory on disk, registration intact. That is
+  // what makes it leak: `worktree prune` will not reclaim a registration whose
+  // directory still exists, so nothing here is self-healing by default.
+  assert.ok(existsSync(crashed.dir), 'the fixture must leave the crashed worktree in place')
+
+  // Round 2 of the same PR, at a new head.
+  const next = await checkouts.worktreeForPr({ repo: 'o/r', number: 5, sha: tipSha, fetchRef: 'refs/heads/main' })
+  assert.equal(
+    execFileSync('git', ['-C', next.dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+    tipSha,
+    'the retry must still produce a usable worktree'
+  )
+
+  const listed = execFileSync('git', ['-C', cloneDir, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' })
+  assert.equal(listed.includes(crashed.dir), false, `the crashed worktree is still registered:\n${listed}`)
+  assert.equal(existsSync(crashed.dir), false, 'the crashed worktree directory is still on disk')
+  assert.equal(refsIn(cloneDir), '', 'refs/pr-review-bot must not accumulate one ref per PR')
+
+  await next.cleanup()
+  assert.equal(refsIn(cloneDir), '', 'cleanup must not leave a ref behind either')
+})
+
+// The other shape a crash leaves behind: the directory is gone (cleaned by a
+// reboot or by the OS temp sweeper) but git's registration for it is not. The
+// retry has to prune that registration rather than trip over it.
+test('a worktree whose directory vanished does not block the next review', async () => {
+  const origin = makeOrigin()
+  const clonesDir = tempDir('clones-')
+  const checkouts = createCheckouts({ clonesDir, remoteUrlFor: () => origin.dir })
+  const cloneDir = cloneDirFor(clonesDir, 'o/r')
+
+  const crashed = await checkouts.worktreeForPr({ repo: 'o/r', number: 9, sha: origin.sha, fetchRef: 'refs/heads/main' })
+  rmSync(crashed.dir, { recursive: true, force: true })
+
+  const next = await checkouts.worktreeForPr({ repo: 'o/r', number: 9, sha: origin.sha, fetchRef: 'refs/heads/main' })
+  assert.match(readFileSync(join(next.dir, 'app.js'), 'utf8'), /answer = 42/, 'the retry must produce a readable worktree')
+  const listed = execFileSync('git', ['-C', cloneDir, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' })
+  assert.equal((listed.match(/^worktree /gm) || []).length, 2, `expected the clone and one worktree:\n${listed}`)
+  assert.equal(refsIn(cloneDir), '')
+  await next.cleanup()
+})

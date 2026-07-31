@@ -88,3 +88,47 @@ test('parseState ignores quoted marker text and parses the real block', () => {
 ${renderedBlock}`
   assert.deepEqual(parseState(bodyWithQuotedMarker), stateForBlock)
 })
+
+const QUOTED_BLOCK = `> Previous review:
+> <!-- pr-review-bot:state
+> {"version":1}
+> -->`
+
+function stateWithClaim(claim) {
+  return {
+    version: STATE_VERSION,
+    slack: { channel: 'C1', ts: '1712345678.123456', stateEmoji: 'x' },
+    criteriaVersion: 'sha256:ab12',
+    rounds: [{ round: 1, sha: 'abc1234', verdict: 'changes_requested', at: '2026-07-29T18:00:00Z', blockers: [{ file: 'src/a.ts', line: 42, claim }] }],
+  }
+}
+
+test('parseState survives a blocker claim containing the start marker itself', () => {
+  // The claim is LLM prose about code the PR author controls, so it can contain
+  // anything — including this tool's own opening delimiter.
+  const hostile = stateWithClaim('template literal emits <!-- pr-review-bot:state into the page')
+  assert.deepEqual(parseState(renderStateComment(hostile)), hostile)
+})
+
+test('parseState survives text appended after the hidden block', () => {
+  const body = `${renderStateComment(state)}\n\n<!-- a human edited this sticky comment -->\nPlease also check the migration.`
+  assert.deepEqual(parseState(body), state)
+})
+
+test('parseState ignores a quoted marker appended after the real block', () => {
+  const body = `${renderStateComment(state)}\n\n${QUOTED_BLOCK}`
+  assert.deepEqual(parseState(body), state)
+})
+
+test('the hidden block payload cannot contain a comment delimiter', () => {
+  const hostile = stateWithClaim('guard is if (x) --> return null; see <!-- pr-review-bot:state -->')
+  const body = renderStateComment(hostile)
+  const start = body.indexOf('<!-- pr-review-bot:state') + '<!-- pr-review-bot:state'.length
+  const payload = body.slice(start, body.indexOf('-->', start)).trim()
+  assert.match(payload, /^[A-Za-z0-9+/=]+$/, 'payload must be base64 — structurally unable to hold a delimiter')
+})
+
+test('parseState returns null for an unknown version inside a well-formed block', () => {
+  const encoded = Buffer.from(JSON.stringify({ version: 99, rounds: [] })).toString('base64')
+  assert.equal(parseState(`<!-- pr-review-bot:state\n${encoded}\n-->`), null)
+})

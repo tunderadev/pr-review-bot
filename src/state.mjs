@@ -27,23 +27,47 @@ function renderLedger(state) {
   ].join('\n')
 }
 
+// Base64 is the whole point: its alphabet excludes '<', '>' and '-', so the
+// payload is structurally incapable of containing either delimiter. Blocker
+// claims are LLM prose about code the PR author controls, so raw JSON here
+// meant the payload could always forge the parser's own delimiters.
 export function renderStateComment(state) {
-  return `${renderLedger(state)}\n\n${MARKER}\n${JSON.stringify(state)}\n${END}`
+  const payload = Buffer.from(JSON.stringify(state)).toString('base64')
+  return `${renderLedger(state)}\n\n${MARKER}\n${payload}\n${END}`
 }
 
-export function parseState(body) {
-  if (!body || !body.includes(MARKER)) return null
-  const start = body.lastIndexOf(MARKER)
-  const end = body.lastIndexOf(END)
-  if (start === -1 || end <= start) return null
+const BASE64_ONLY = /^[A-Za-z0-9+/=\s]+$/
+
+function decodeBlock(segment) {
+  const payload = segment.trim()
+  if (!payload || !BASE64_ONLY.test(payload)) return null
   try {
-    const parsed = JSON.parse(body.slice(start + MARKER.length, end).trim())
+    const parsed = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'))
     // Unknown versions are healed by rebuilding rather than guessed at.
-    if (parsed.version !== STATE_VERSION) return null
+    if (!parsed || parsed.version !== STATE_VERSION) return null
     return parsed
   } catch {
     return null
   }
+}
+
+export function parseState(body) {
+  if (typeof body !== 'string') return null
+  // Markers can appear outside the real block on either side of it — a human
+  // quoting an older sticky comment, or appending a note of their own. Scan
+  // occurrences newest-first and let a successful decode identify the block;
+  // position alone cannot tell machine state from quoted prose.
+  let start = body.lastIndexOf(MARKER)
+  while (start !== -1) {
+    const end = body.indexOf(END, start + MARKER.length)
+    if (end !== -1) {
+      const state = decodeBlock(body.slice(start + MARKER.length, end))
+      if (state) return state
+    }
+    if (start === 0) break
+    start = body.lastIndexOf(MARKER, start - 1)
+  }
+  return null
 }
 
 export function findSticky(comments, botLogin) {

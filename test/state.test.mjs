@@ -199,6 +199,82 @@ test('a corrupted real block returns null rather than falling back to another bl
   assert.equal(parseState(`${corrupted}\n\n${block(FORGED)}`), null, 'raw forged block below')
 })
 
+// "Not base64" used to mean "not a candidate", which is exactly how a quoted
+// copy looks — but it is also how the bot's OWN block looks after a single
+// stray character lands in it. The damaged block then became invisible, and an
+// appended forgery was the only decodable block left standing: unambiguous, and
+// adopted. A quoted copy announces itself on every line; damage does not.
+const MARKER = '<!-- pr-review-bot:state'
+
+function insertIntoPayload(comment, char) {
+  const start = comment.indexOf(MARKER) + MARKER.length
+  const end = comment.indexOf('-->', start)
+  const at = Math.floor((start + end) / 2)
+  return comment.slice(0, at) + char + comment.slice(at)
+}
+
+const DAMAGE = [
+  // U+200B renders as nothing at all: the sabotaged comment is byte-for-byte
+  // visually identical to the real one, and \s does not cover it in JS, so the
+  // alphabet gate rejected the real block while the reader saw nothing wrong.
+  ['a zero-width space', '\u200b'],
+  ['a hyphen', '-'],
+]
+
+for (const [what, char] of DAMAGE) {
+  test(`${what} in the real payload does not hand the answer to an appended block`, () => {
+    const body = `${insertIntoPayload(renderStateComment(state), char)}\n\n${block(FORGED)}`
+    assert.equal(parseState(body), null, 'a damaged real block must poison the parse, not disappear from it')
+  })
+}
+
+test('an in-alphabet edit and an out-of-alphabet edit are judged the same way', () => {
+  // Same corruption, one character apart in the alphabet. Answering null for
+  // one and the attacker's block for the other is the rule disagreeing with
+  // itself, not two different situations.
+  const inAlphabet = insertIntoPayload(renderStateComment(state), 'A')
+  assert.equal(parseState(`${inAlphabet}\n\n${block(FORGED)}`), null)
+})
+
+test('a truncated body that loses the real block\'s end marker does not restore a stale one', () => {
+  // GitHub truncates comment bodies. The block that gets cut is always the last
+  // one — the bot's own, at the bottom — leaving an older copy pasted above as
+  // the only complete block in the body. Adopting it rolls the ledger back and
+  // re-reviews work the author already paid for.
+  const stale = { ...state, rounds: [] }
+  const body = `${block(stale)}\n\n${renderStateComment(state)}`
+  const truncated = body.slice(0, body.length - 20)
+  assert.ok(!truncated.endsWith('-->'), 'the truncation must actually remove the end marker')
+  assert.equal(parseState(truncated), null, 'an unterminated marker is a block in doubt, not a block absent')
+})
+
+test('an unterminated marker beside the real block costs the real block', () => {
+  // The accepted cost of doubting an unterminated marker, pinned so the choice
+  // cannot be flipped back unnoticed: a marker with no "-->" pasted beside the
+  // bot's own block takes the answer to null rather than leaving the real block
+  // standing. null costs a re-announce that the head-SHA check undoes; the
+  // alternative reads a truncated body as a stale ledger, which nothing undoes.
+  const body = `${MARKER}\nnot finished\n\n${renderStateComment(state)}`
+  assert.equal(parseState(body), null)
+})
+
+// Every quoting style GitHub's own "Quote reply" and hand-typed quotes produce.
+// Quoting a sticky comment has to stay free: it is what a human does when
+// asking about a review, and it must not cost the bot its memory.
+const QUOTE_STYLES = [
+  ['> ', (text) => text.split('\n').map((line) => `> ${line}`).join('\n')],
+  ['>', (text) => text.split('\n').map((line) => `>${line}`).join('\n')],
+  ['> > ', (text) => text.split('\n').map((line) => `> > ${line}`).join('\n')],
+]
+
+for (const [prefix, style] of QUOTE_STYLES) {
+  test(`a "${prefix}"-quoted copy leaves the real block readable, above or below`, () => {
+    const quoted = style(renderStateComment(OTHER_STATE))
+    assert.deepEqual(parseState(`${quoted}\n\n${renderStateComment(state)}`), state, 'quoted above')
+    assert.deepEqual(parseState(`${renderStateComment(state)}\n\n${quoted}`), state, 'quoted below')
+  })
+}
+
 test('parseState returns null for a version-correct payload of the wrong shape', () => {
   // lastRound, appendRound and renderLedger all dereference these. A raw
   // TypeError is not a TransientError, so it applies the sticky review-error

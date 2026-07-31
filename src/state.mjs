@@ -60,20 +60,40 @@ function isValidState(parsed) {
 
 // "Did not decode" is two different facts and they carry opposite weight.
 //
-// NOT_A_CANDIDATE: the payload is outside base64's alphabet. That is exactly
-// what a "> "-quoted copy of a real block looks like, and quoting a sticky
-// comment has to stay free — so these are ignored entirely.
+// NOT_A_CANDIDATE: a markdown-quoted copy of a real block. Quoting a sticky
+// comment has to stay free — it is what a human does when asking about a
+// review — so these are ignored entirely.
 //
-// SUSPECT: the payload IS base64 but yields no valid state. Either the bot's
-// own block is damaged or someone wrote a block of their own. Nothing else in
-// the body can be trusted to be the bot's memory after that, so a SUSPECT
-// block poisons the whole parse rather than being skipped over.
+// SUSPECT: anything else that fails to yield a valid state, whether it is
+// base64 that decodes to nothing valid or a payload outside the alphabet
+// entirely. Either the bot's own block is damaged or someone wrote a block of
+// their own. Nothing else in the body can be trusted to be the bot's memory
+// after that, so a SUSPECT block poisons the whole parse rather than being
+// skipped over.
 const NOT_A_CANDIDATE = Symbol('not-a-candidate')
 const SUSPECT = Symbol('suspect')
 
+// Leaving the alphabet is not by itself evidence of quoting, and reading it
+// that way was a hole big enough to drive the whole attack through: ONE
+// character outside [A-Za-z0-9+/=\s] anywhere in the real payload made the
+// bot's own block invisible, leaving an appended forgery as the only decodable
+// block in the body — unambiguous, and adopted. A zero-width space does it
+// while leaving the comment visually identical to the untouched one. The same
+// corruption done with an in-alphabet character has always returned null, so
+// only one of those two answers can be right.
+//
+// A quote, unlike damage, announces itself: markdown quoting prefixes EVERY
+// line, at any nesting depth and with or without the space after ">". So
+// quoting is recognised positively, and a segment carrying no quoted line at
+// all — including an emptied payload — is doubted rather than ignored.
+function looksQuoted(segment) {
+  const lines = segment.split('\n').filter((line) => line.trim())
+  return lines.length > 0 && lines.every((line) => /^\s*>/.test(line))
+}
+
 function classifyBlock(segment) {
   const payload = segment.trim()
-  if (!payload || !BASE64_ONLY.test(payload)) return NOT_A_CANDIDATE
+  if (!payload || !BASE64_ONLY.test(payload)) return looksQuoted(segment) ? NOT_A_CANDIDATE : SUSPECT
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'))
     // Unknown versions are healed by rebuilding rather than guessed at.
@@ -104,9 +124,13 @@ export function parseState(body) {
   let found = null
   for (const segment of body.split(MARKER).slice(1)) {
     const end = segment.indexOf(END)
-    // An unterminated marker carries no payload at all: nothing to adopt and
-    // nothing to doubt.
-    if (end === -1) continue
+    // An unterminated marker is a block whose end was LOST, not a block that
+    // was never there. GitHub truncates long comment bodies, and the block that
+    // gets cut is always the bot's own — it is written last, at the bottom — so
+    // skipping it silently promoted an older copy pasted above into the only
+    // complete block in the body, rolling the ledger back. Doubting it costs a
+    // re-announce; skipping it cost the ledger.
+    if (end === -1) return null
     const block = classifyBlock(segment.slice(0, end))
     if (block === NOT_A_CANDIDATE) continue
     if (block === SUSPECT || found) return null

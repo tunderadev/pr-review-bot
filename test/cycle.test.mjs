@@ -545,6 +545,30 @@ test('a Slack announcement failure downgrades to no thread and still reviews', a
   assert.equal(parseState(named(actions, 'comment')[0][1]).slack, null)
 })
 
+test('a PR that planted agent configuration is named in the log, not silently cleaned', async () => {
+  // Stripping a SessionStart hook out of a PR is the tool defending itself
+  // against an attempted compromise of the operator's machine. Doing it without
+  // saying so means nobody ever finds out it happened.
+  const { deps, logs } = makeDeps({
+    worktreeForPr: async () => ({ dir: '/wt', removed: ['.claude', '.mcp.json', 'packages/api/CLAUDE.md'], cleanup: async () => {} }),
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(out.processed[0].outcome, 'reviewed', 'stripping them must not fail the review')
+  const warned = logs.find((m) => m.includes('.mcp.json'))
+  assert.ok(warned, `nothing reported the stripped configuration: ${JSON.stringify(logs)}`)
+  assert.match(warned, /o\/r#7/, 'the warning names the PR that carried it')
+  assert.match(warned, /\.claude/)
+  assert.match(warned, /packages\/api\/CLAUDE\.md/)
+})
+
+test('an ordinary PR produces no stripped-configuration warning', async () => {
+  const { deps, logs } = makeDeps({
+    worktreeForPr: async () => ({ dir: '/wt', removed: [], cleanup: async () => {} }),
+  })
+  await runCycle({ config, deps, now: NOW })
+  assert.equal(logs.some((m) => /stripped/i.test(m)), false, `a clean PR must not look like an attack: ${JSON.stringify(logs)}`)
+})
+
 test('the worktree is cleaned up even when the review throws', async () => {
   const { deps, actions } = makeDeps({ runReview: async () => { throw new Error('verdict unparseable') } })
   await runCycle({ config, deps, now: NOW })

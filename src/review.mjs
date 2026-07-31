@@ -76,7 +76,71 @@ export function parseVerdict(text) {
 }
 
 // No --model: headless children inherit the operator's saved CLI default.
-const CLAUDE_ARGS = ['-p', '--output-format', 'json', '--allowed-tools', 'Read Grep Glob']
+//
+// --strict-mcp-config, with no --mcp-config to go with it, means "use the MCP
+// servers named on this command line and no others" — which is none. Without
+// it, a `.mcp.json` in the working directory is DISCOVERED, and every
+// mcpServers[].command in it is a shell command that runs at startup. An MCP
+// server is not a tool, so --allowed-tools does not gate it.
+const CLAUDE_ARGS = ['-p', '--output-format', 'json', '--allowed-tools', 'Read Grep Glob', '--strict-mcp-config']
+
+// ---------------------------------------------------------------------------
+// The child's environment
+//
+// The child runs with its working directory set to a worktree of the PR head,
+// so anything that does manage to execute inside it — a hook, an MCP server, a
+// `claude` shim — reads this environment. `spawn` with no `env` hands it
+// process.env ENTIRE: SLACK_BOT_TOKEN, GITHUB_APP_PRIVATE_KEY_PATH, and
+// whatever else the operator's shell happens to be carrying. So the child is
+// given an explicit list instead: enough to run and to find its own
+// credentials, and nothing this tool holds.
+//
+// ANTHROPIC_API_KEY and its relatives are deliberately absent. `doctor` already
+// FAILS when one is set, because it silently redirects billing from the
+// operator's Claude subscription to metered API usage; withholding it here
+// makes the allow-list enforce that rule instead of merely reporting it, and
+// keeps a live credential out of a process running inside a stranger's code.
+// The same goes for ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
+// CLAUDE_CODE_USE_BEDROCK and CLAUDE_CODE_USE_VERTEX.
+export const CHILD_ENV_ALLOWLIST = [
+  'PATH', // there is no claude to spawn without it
+  'HOME', // ~/.claude.json is where the subscription login lives
+  'CLAUDE_CONFIG_DIR', // …unless the operator moved it
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TERM',
+  'TMPDIR',
+]
+
+// execvp resolves a bare command name against PATH, and a ZERO-LENGTH entry in
+// PATH — a leading ":", a trailing ":", "::" in the middle — means "the current
+// directory", as does a literal ".". The child's current directory is the PR
+// author's tree. Left alone, an executable file named `claude` committed at the
+// repo root is what runs: no hook, no MCP server, no settings file, and nothing
+// the other two layers touch. Verified against Node's spawn, which is why this
+// exists at all.
+//
+// An emptied PATH is DROPPED rather than set: PATH="" is itself a single
+// zero-length entry, so writing it back would reinstate precisely this.
+function absoluteEntriesOnly(rawPath) {
+  return String(rawPath).split(':').filter((entry) => entry.startsWith('/')).join(':')
+}
+
+export function buildChildEnv(env = process.env) {
+  const child = {}
+  for (const key of CHILD_ENV_ALLOWLIST) {
+    // Absent stays absent. `{FOO: undefined}` in a spawn env reaches the child
+    // as the literal string "undefined", which is worse than not being there.
+    if (env[key] !== undefined) child[key] = env[key]
+  }
+  if (child.PATH !== undefined) {
+    const safe = absoluteEntriesOnly(child.PATH)
+    if (safe) child.PATH = safe
+    else delete child.PATH
+  }
+  return child
+}
 
 // A deep review of a large PR is legitimately slow, so this is generous: it
 // exists to bound a WEDGED child, not a slow one.
@@ -93,10 +157,10 @@ export const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60_000
 // exactly what the per-PR label is for.
 export class ReviewTimeoutError extends Error {}
 
-export function runClaude({ prompt, cwd, spawnImpl = spawn, timeoutMs = DEFAULT_REVIEW_TIMEOUT_MS }) {
+export function runClaude({ prompt, cwd, spawnImpl = spawn, timeoutMs = DEFAULT_REVIEW_TIMEOUT_MS, env = process.env }) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
-    const child = spawnImpl('claude', CLAUDE_ARGS, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawnImpl('claude', CLAUDE_ARGS, { cwd, stdio: ['pipe', 'pipe', 'pipe'], env: buildChildEnv(env) })
     let out = ''
     let err = ''
     let settled = false

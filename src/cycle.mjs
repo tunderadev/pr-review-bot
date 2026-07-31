@@ -329,6 +329,20 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       binding = await slackOps.reconcile(binding, 'in_review', ref)
 
       worktree = await checkouts.worktreeForPr({ repo: pr.repo, number: pr.number, sha: pr.headSha })
+      // The checkout strips agent configuration the PR author planted — a
+      // SessionStart hook in .claude/settings.json, an mcpServers[].command in
+      // .mcp.json — because `claude` would otherwise execute it as the operator
+      // on startup. Stripping it silently means an attempted compromise of this
+      // machine leaves no trace anywhere. Named, never fatal: the review is
+      // perfectly good without those files, and refusing to review would hand
+      // any PR author a way to bench the bot.
+      if (worktree.removed?.length) {
+        log(
+          `${ref}: stripped ${worktree.removed.length} agent-configuration path(s) from the checkout before reviewing — ` +
+            `${worktree.removed.join(', ')}. Claude Code would execute hooks and MCP servers declared in these, so they are ` +
+            `removed from every checkout; the review continues without them.`
+        )
+      }
 
       phase = 'review'
       const reviewResult = await runReview({

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { Readable, Writable } from 'node:stream'
-import { buildReviewPrompt, parseVerdict, VerdictParseError, runClaude, isUsageLimit, runReview, ReviewTimeoutError, DEFAULT_REVIEW_TIMEOUT_MS } from '../src/review.mjs'
+import { buildReviewPrompt, parseVerdict, VerdictParseError, runClaude, isUsageLimit, runReview, ReviewTimeoutError, DEFAULT_REVIEW_TIMEOUT_MS, buildChildEnv, CHILD_ENV_ALLOWLIST } from '../src/review.mjs'
 
 const PR = { repo: 'o/r', number: 7, title: '[PLAT] add widget', author: 'octocat', headSha: 'abc1234', url: 'u' }
 
@@ -16,7 +16,7 @@ function fakeSpawn(envelopes) {
     child.stdout = Readable.from([typeof envelope === 'string' ? envelope : JSON.stringify(envelope)])
     child.stderr = Readable.from([])
     setImmediate(() => {
-      seen.push({ cmd, args, cwd: opts?.cwd, prompt: stdinText })
+      seen.push({ cmd, args, cwd: opts?.cwd, env: opts?.env, prompt: stdinText })
       child.emit('close', envelope?.__exit ?? 0)
     })
     return child
@@ -89,7 +89,102 @@ test('runClaude passes no --model, allows only read-only tools, sends prompt on 
   // The whole argv, not a substring: a pin appended at the end, spelled `-m`, or
   // fused as `--model=opus` all slip past an `includes('--model')` check.
   assert.equal(seen[0].cmd, 'claude')
-  assert.deepEqual(seen[0].args, ['-p', '--output-format', 'json', '--allowed-tools', 'Read Grep Glob'])
+  assert.deepEqual(seen[0].args, ['-p', '--output-format', 'json', '--allowed-tools', 'Read Grep Glob', '--strict-mcp-config'])
+})
+
+// ---------------------------------------------------------------------------
+// The child's cwd is a worktree of the PR head — a tree the PR AUTHOR wrote.
+// Claude Code reads project configuration from its working directory at session
+// start, and hooks and MCP servers are not tools, so --allowed-tools gates
+// neither. checkout.mjs strips that configuration out of the tree; these are
+// the other two layers, which have to hold even if that one is bypassed.
+// ---------------------------------------------------------------------------
+
+const TOOL_ENV = {
+  PATH: '/usr/local/bin:/usr/bin:/bin',
+  HOME: '/Users/operator',
+  LANG: 'en_US.UTF-8',
+  TERM: 'xterm-256color',
+  // Everything below is this tool's own and must not reach a child running
+  // inside a stranger's code.
+  SLACK_BOT_TOKEN: 'xoxb-' + '1111-2222-abcdefghijklmnop',
+  GITHUB_APP_PRIVATE_KEY_PATH: '/Users/operator/.config/pr-review-bot/app.pem',
+  GITHUB_APP_ID: '123456',
+  GITHUB_APP_INSTALLATION_ID: '7890',
+  PR_REVIEW_CONFIG_DIR: '/Users/operator/.config/pr-review-bot/default',
+  AWS_SECRET_ACCESS_KEY: 'wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY',
+  ANTHROPIC_API_KEY: 'sk-ant-api03-should-never-be-handed-down',
+}
+
+test('MCP configuration is never discovered from the tree under review', async () => {
+  const { impl, seen } = fakeSpawn([{ subtype: 'success', is_error: false, result: 'ok', usage: {}, total_cost_usd: 0, duration_ms: 1 }])
+  await runClaude({ prompt: 'p', cwd: '/wt', spawnImpl: impl, env: TOOL_ENV })
+  // A .mcp.json in the PR runs mcpServers[].command. It is not a tool, so
+  // --allowed-tools does not gate it.
+  assert.ok(seen[0].args.includes('--strict-mcp-config'), `no --strict-mcp-config in ${JSON.stringify(seen[0].args)}`)
+})
+
+test('the child gets an allow-listed environment, not the bot\'s own', async () => {
+  const { impl, seen } = fakeSpawn([{ subtype: 'success', is_error: false, result: 'ok', usage: {}, total_cost_usd: 0, duration_ms: 1 }])
+  await runClaude({ prompt: 'p', cwd: '/wt', spawnImpl: impl, env: TOOL_ENV })
+  const childEnv = seen[0].env
+
+  assert.ok(childEnv, 'spawn must be given an explicit env, or the child inherits process.env entire')
+  // Named, not merely "not everything": a hook or an MCP server in the PR reads
+  // these straight out of its own environment.
+  for (const secret of ['SLACK_BOT_TOKEN', 'GITHUB_APP_PRIVATE_KEY_PATH', 'GITHUB_APP_ID', 'GITHUB_APP_INSTALLATION_ID', 'AWS_SECRET_ACCESS_KEY', 'PR_REVIEW_CONFIG_DIR']) {
+    assert.equal(childEnv[secret], undefined, `${secret} was handed to a child running inside a stranger's code`)
+  }
+  // And by value, so a rename of the variable cannot smuggle it through.
+  const values = Object.values(childEnv).join('\n')
+  for (const secret of [TOOL_ENV.SLACK_BOT_TOKEN, TOOL_ENV.GITHUB_APP_PRIVATE_KEY_PATH, TOOL_ENV.AWS_SECRET_ACCESS_KEY, TOOL_ENV.ANTHROPIC_API_KEY]) {
+    assert.equal(values.includes(secret), false, `a secret value reached the child: ${secret}`)
+  }
+  // …and it must still be able to run and find its own credentials.
+  assert.equal(childEnv.HOME, '/Users/operator', 'without HOME claude cannot find its own login')
+  assert.ok(childEnv.PATH?.includes('/usr/bin'), 'without PATH there is no claude to spawn')
+  assert.equal(childEnv.LANG, 'en_US.UTF-8')
+})
+
+test('ANTHROPIC_API_KEY is deliberately withheld, matching doctor\'s refusal', async () => {
+  // doctor fails outright when it is set, because it silently redirects billing
+  // from the operator's subscription to metered API usage. Passing it down would
+  // let a stray export in one shell quietly bill the API for every review — and
+  // it is a live credential handed to a child running inside a stranger's code.
+  const { impl, seen } = fakeSpawn([{ subtype: 'success', is_error: false, result: 'ok', usage: {}, total_cost_usd: 0, duration_ms: 1 }])
+  await runClaude({ prompt: 'p', cwd: '/wt', spawnImpl: impl, env: TOOL_ENV })
+  for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX']) {
+    assert.equal(seen[0].env[key], undefined, `${key} must not travel to the review child`)
+    assert.equal(CHILD_ENV_ALLOWLIST.includes(key), false, `${key} must not be on the allow-list`)
+  }
+})
+
+// Found by attacking the fix rather than trusting it. execvp treats a
+// ZERO-LENGTH PATH entry — a trailing ":", a leading ":", or a literal "." — as
+// "the current directory", and the child's current directory is the PR author's
+// tree. An executable file named `claude` committed at the repo root is then
+// what runs, with no hook, no MCP server, and no settings file involved. The
+// three layers above do nothing about it; only a sanitized PATH does.
+test('a PATH entry meaning "the current directory" cannot make the PR\'s own tree executable', () => {
+  assert.equal(buildChildEnv({ PATH: '/usr/bin:/bin:', HOME: '/h' }).PATH, '/usr/bin:/bin')
+  assert.equal(buildChildEnv({ PATH: ':/usr/bin', HOME: '/h' }).PATH, '/usr/bin')
+  assert.equal(buildChildEnv({ PATH: '/usr/bin:.:/bin', HOME: '/h' }).PATH, '/usr/bin:/bin')
+  assert.equal(buildChildEnv({ PATH: '/usr/bin::/bin', HOME: '/h' }).PATH, '/usr/bin:/bin')
+  assert.equal(buildChildEnv({ PATH: 'relative/bin:/usr/bin', HOME: '/h' }).PATH, '/usr/bin')
+  // An emptied PATH must be ABSENT, not empty: PATH="" is itself one
+  // zero-length entry, so setting it would reinstate exactly what this removes.
+  assert.equal('PATH' in buildChildEnv({ PATH: '.', HOME: '/h' }), false, 'an emptied PATH must be dropped, never set to ""')
+  assert.equal('PATH' in buildChildEnv({ HOME: '/h' }), false)
+})
+
+test('buildChildEnv passes through only what is on the allow-list, and never a blank', () => {
+  const built = buildChildEnv(TOOL_ENV)
+  assert.deepEqual(Object.keys(built).sort(), ['HOME', 'LANG', 'PATH', 'TERM'])
+  assert.deepEqual(buildChildEnv({}), {}, 'an empty environment yields an empty environment, not undefineds')
+  // Absent keys are omitted rather than set to undefined: `{FOO: undefined}` in
+  // a spawn env is passed to the child as the literal string "undefined".
+  assert.equal('LC_ALL' in buildChildEnv({ HOME: '/h' }), false)
+  assert.ok(CHILD_ENV_ALLOWLIST.includes('HOME') && CHILD_ENV_ALLOWLIST.includes('PATH'))
 })
 
 test('isUsageLimit detects quota exhaustion for the transient path', () => {

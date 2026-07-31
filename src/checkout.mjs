@@ -36,6 +36,81 @@ function credentialEnv(credential) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sanitization
+//
+// The worktree this module produces becomes the WORKING DIRECTORY of a headless
+// `claude`, and every byte in it was chosen by the PR author. Claude Code reads
+// its project configuration from that directory at session start:
+// `.claude/settings.json` can declare a SessionStart hook, and `.mcp.json` can
+// declare an MCP server — both of which are shell commands, neither of which is
+// a TOOL, so `--allowed-tools 'Read Grep Glob'` gates neither. A PR containing
+// either runs arbitrary code as the operator, with the operator's environment,
+// before the review has read one line of the diff. For any repo that accepts
+// fork PRs, the trigger is available to anyone whose PR a maintainer labels.
+//
+// So the sanitization lives HERE, in the function that produces the worktree,
+// rather than in the caller that spawns the reviewer: the tree handed back is
+// already safe and no future caller can forget to make it so.
+//
+// Removing these costs the review nothing. The authority on how to review is
+// the team's own review-criteria.md, which travels in the prompt; anything the
+// PR itself has to say about how it would like to be reviewed is not evidence.
+const AGENT_CONFIG_NAMES = new Set([
+  '.claude', // settings.json (hooks, env, permissions), agents/, commands/, hooks/, skills/
+  '.claude-plugin', // plugin.json and marketplace.json
+  '.mcp.json', // mcpServers[].command — a shell command, executed at startup
+  'claude.md',
+  'claude.local.md',
+  'agents.md',
+])
+
+// Lower-cased, because macOS — the laptop deployment this tool is designed for —
+// is case-insensitive by default: a file committed as `.CLAUDE/settings.json`
+// IS `.claude/settings.json` to everything that opens it, Claude Code included.
+// A case-sensitive match would be a one-keystroke bypass of the whole layer.
+const isAgentConfig = (name) => AGENT_CONFIG_NAMES.has(name.toLowerCase())
+
+// Returns the worktree-relative paths it removed. Never absolute: this list is
+// logged, and no local path of the operator's belongs in output.
+export function sanitizeWorktree(dir) {
+  const removed = []
+  // An explicit worklist rather than recursion: the depth here is chosen by the
+  // PR author, and a pathological tree must not be able to overflow the stack of
+  // a process that runs unattended.
+  const pending = [{ abs: dir, rel: '' }]
+  while (pending.length) {
+    const { abs, rel } = pending.pop()
+    let entries
+    try {
+      entries = readdirSync(abs, { withFileTypes: true })
+    } catch {
+      // A directory that vanished or cannot be read is not a reason to fail a
+      // review; there is nothing in it left to strip.
+      continue
+    }
+    for (const entry of entries) {
+      // Never descended into and never removed: the repository's own metadata,
+      // which the PR author cannot write through a checkout anyway.
+      if (entry.name === '.git') continue
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name
+      if (isAgentConfig(entry.name)) {
+        // rmSync on a SYMLINK unlinks the link and leaves its target alone, so a
+        // planted `.claude -> ~/.claude` deletes the plant, not the operator's
+        // own configuration.
+        rmSync(join(abs, entry.name), { recursive: true, force: true })
+        removed.push(childRel)
+        continue
+      }
+      // isDirectory() is false for a symlink — readdir reports the link itself,
+      // not what it points at — so the walk can never be steered out of the
+      // worktree by a link the PR author committed.
+      if (entry.isDirectory()) pending.push({ abs: join(abs, entry.name), rel: childRel })
+    }
+  }
+  return removed.sort()
+}
+
 // Embedding the token in the clone URL is the obvious way to authenticate, and
 // it is the one that persists it. A caller who does it anyway gets the
 // credential lifted out of the URL and delivered the safe way instead, so the
@@ -117,8 +192,13 @@ export function createCheckouts({
       // commit alive from here, so drop it rather than leaving one ref per PR
       // ever reviewed pinned inside the clone forever.
       await git(['update-ref', '-d', ref], cloneDir).catch(() => {})
+      // Before the worktree is handed to anyone, and so before any `claude` can
+      // be pointed at it. Not the caller's job: a caller who forgets gives a
+      // stranger's PR a shell on the operator's machine.
+      const removed = sanitizeWorktree(dir)
       return {
         dir,
+        removed,
         cleanup: async () => {
           await git(['worktree', 'remove', '--force', dir], cloneDir).catch(() => {})
           rmSync(dir, { recursive: true, force: true })

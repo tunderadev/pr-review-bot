@@ -5,12 +5,18 @@ import { createSlack, SlackError } from '../src/slack.mjs'
 // Slack signals failure with HTTP 200 and {ok:false,error}. The stub pins
 // res.ok true on every response so a client that trusts res.ok reports every
 // failure below as a success.
+//
+// The body is decoded the way a Slack endpoint decodes it: as a form, not as
+// JSON. Every Web API method accepts application/x-www-form-urlencoded and
+// only some accept JSON — users.lookupByEmail is one that does not, and
+// answers invalid_arguments to a JSON body — so form encoding is the only
+// transport that works for all of them.
 function stub(responses) {
   const calls = []
   const impl = async (url, init) => {
     calls.push({
       url,
-      body: JSON.parse(init.body),
+      body: Object.fromEntries(new URLSearchParams(init.body)),
       auth: init.headers.authorization,
       method: init.method,
       contentType: init.headers['content-type'],
@@ -32,7 +38,22 @@ test('postMessage returns the ts used for all later thread and reaction calls', 
   // at the first live call, and a JSON body with no content-type is rejected
   // by Slack — neither is observable through a stub that only reads the body.
   assert.equal(calls[0].method, 'POST')
-  assert.equal(calls[0].contentType, 'application/json; charset=utf-8')
+  assert.equal(calls[0].contentType, 'application/x-www-form-urlencoded; charset=utf-8')
+})
+
+test('structured arguments survive form encoding', async () => {
+  // A form is flat, so blocks travel as a JSON string — which is exactly what
+  // Slack expects on a form-encoded request — and booleans as "true"/"false".
+  // An absent optional argument must be absent, not the string "undefined".
+  const { impl, calls } = stub([{ ok: true, ts: '1' }])
+  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: '*PR* ready' } }]
+  await createSlack({ token: 't', fetchImpl: impl }).postMessage({ channel: 'C1', text: 'hi', blocks })
+  assert.deepEqual(JSON.parse(calls[0].body.blocks), blocks)
+  assert.equal(calls[0].body.unfurl_links, 'false')
+
+  const bare = stub([{ ok: true, ts: '1' }])
+  await createSlack({ token: 't', fetchImpl: bare.impl }).postMessage({ channel: 'C1', text: 'hi' })
+  assert.ok(!('blocks' in bare.calls[0].body), `blocks sent as ${JSON.stringify(bare.calls[0].body.blocks)}`)
 })
 
 test('postThreadReply targets the parent ts', async () => {
@@ -69,6 +90,56 @@ test('a non-benign reaction error still throws', async () => {
 test('other Slack errors throw SlackError naming the error code', async () => {
   const { impl } = stub([{ ok: false, error: 'not_in_channel' }])
   await assert.rejects(createSlack({ token: 't', fetchImpl: impl }).postMessage({ channel: 'C1', text: 'hi' }), (e) => e instanceof SlackError && /not_in_channel/.test(e.message))
+})
+
+test('the reaction idempotency codes are benign only on the reaction methods', async () => {
+  // Applied to every method, a chat.postMessage that came back already_reacted
+  // was read as a success and returned {ts: undefined} — which is then written
+  // into the sticky comment as the PR's durable Slack binding, so every later
+  // thread reply and reaction on that PR is addressed to nothing. Silently,
+  // and permanently: nothing later in the pipeline rechecks it.
+  for (const error of ['already_reacted', 'no_reaction']) {
+    const { impl } = stub([{ ok: false, error }])
+    await assert.rejects(
+      createSlack({ token: 't', fetchImpl: impl }).postMessage({ channel: 'C1', text: 'hi' }),
+      (e) => e instanceof SlackError && new RegExp(error).test(e.message),
+      `chat.postMessage swallowed ${error}`
+    )
+    const reply = stub([{ ok: false, error }])
+    await assert.rejects(
+      createSlack({ token: 't', fetchImpl: reply.impl }).postThreadReply({ channel: 'C1', threadTs: '1', text: 'x' }),
+      (e) => e instanceof SlackError,
+      `chat.postMessage (thread reply) swallowed ${error}`
+    )
+    const lookup = stub([{ ok: false, error }])
+    await assert.rejects(
+      createSlack({ token: 't', fetchImpl: lookup.impl }).lookupUserByEmail('a@b.c'),
+      (e) => e instanceof SlackError,
+      `users.lookupByEmail swallowed ${error}`
+    )
+  }
+})
+
+test('a malformed response body is a SlackError, not a raw TypeError', async () => {
+  // A proxy, a 502 page or a truncated response can put anything on the wire.
+  // Callers catch SlackError; a TypeError from reading .ok of null escapes
+  // that, and is not a TransientError either — so it lands as the sticky
+  // review-error label that is never auto-retried, over a bad gateway.
+  const bodies = [
+    ['null', async () => null],
+    ['a bare string', async () => 'gateway timeout'],
+    ['unparseable JSON', async () => { throw new SyntaxError('Unexpected token < in JSON at position 0') }],
+  ]
+  for (const [what, json] of bodies) {
+    const impl = async () => ({ ok: true, status: 200, json })
+    await assert.rejects(
+      createSlack({ token: 't', fetchImpl: impl }).postMessage({ channel: 'C1', text: 'hi' }),
+      // The message has to name the method and must not report the failure as
+      // "undefined" — an operator reading the log learns nothing from that.
+      (e) => e instanceof SlackError && /chat\.postMessage/.test(e.message) && !/undefined/.test(e.message),
+      `${what} did not surface as a usable SlackError`
+    )
+  }
 })
 
 test('lookupUserByEmail returns the member id', async () => {

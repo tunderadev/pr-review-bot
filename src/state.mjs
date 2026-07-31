@@ -33,11 +33,11 @@ export function renderStateComment(state) {
 
 export function parseState(body) {
   if (!body || !body.includes(MARKER)) return null
-  const start = body.indexOf(MARKER) + MARKER.length
-  const end = body.indexOf(END, start)
-  if (end === -1) return null
+  const start = body.lastIndexOf(MARKER)
+  const end = body.lastIndexOf(END)
+  if (start === -1 || end <= start) return null
   try {
-    const parsed = JSON.parse(body.slice(start, end).trim())
+    const parsed = JSON.parse(body.slice(start + MARKER.length, end).trim())
     // Unknown versions are healed by rebuilding rather than guessed at.
     if (parsed.version !== STATE_VERSION) return null
     return parsed

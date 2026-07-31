@@ -60,3 +60,31 @@ test('alreadyReviewedSha matches bot reviews at that exact head SHA', () => {
   assert.equal(alreadyReviewedSha(reviews, 'plat-reviewer[bot]', 'def5678'), false)
   assert.equal(alreadyReviewedSha(reviews, 'plat-reviewer[bot]', 'ghi9999'), false, 'PENDING is not a submitted review')
 })
+
+test('parseState survives blocker claims containing the end marker -->', () => {
+  const stateWithArrow = {
+    version: STATE_VERSION,
+    slack: { channel: 'C1', ts: '1712345678.123456', stateEmoji: 'x' },
+    criteriaVersion: 'sha256:ab12',
+    rounds: [{ round: 1, sha: 'abc1234', verdict: 'changes_requested', at: '2026-07-29T18:00:00Z', blockers: [{ file: 'src/guard.ts', line: 15, claim: 'guard is if (x) --> return null unexpectedly' }] }],
+  }
+  assert.deepEqual(parseState(renderStateComment(stateWithArrow)), stateWithArrow)
+})
+
+test('parseState ignores quoted marker text and parses the real block', () => {
+  const stateForBlock = {
+    version: STATE_VERSION,
+    slack: null,
+    criteriaVersion: null,
+    rounds: [{ round: 1, sha: 'def5678', verdict: 'approved', at: '2026-07-29T19:00:00Z', blockers: [] }],
+  }
+  const renderedBlock = renderStateComment(stateForBlock)
+  // Simulate a quoted prior comment containing the marker
+  const bodyWithQuotedMarker = `> Previous review:
+> <!-- pr-review-bot:state
+> {"version":1}
+> -->
+
+${renderedBlock}`
+  assert.deepEqual(parseState(bodyWithQuotedMarker), stateForBlock)
+})

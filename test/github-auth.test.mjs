@@ -17,6 +17,7 @@ test('mintAppJwt produces a verifiable RS256 JWT with GitHub-required claims', (
   const payload = JSON.parse(Buffer.from(p, 'base64url').toString())
   assert.equal(payload.iss, '12345')
   assert.equal(payload.iat, NOW - 60, 'iat is backdated to tolerate clock skew')
+  assert.ok(payload.exp > payload.iat, 'exp must be after iat — a pre-expired token is rejected on arrival')
   assert.ok(payload.exp - NOW <= 600, 'exp must be within GitHub 10-minute ceiling')
   assert.ok(createVerify('RSA-SHA256').update(`${h}.${p}`).verify(publicKey, Buffer.from(s, 'base64url')))
 })

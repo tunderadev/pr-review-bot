@@ -51,8 +51,14 @@ function safe(text) {
 const openLine = (text) => safe(text).replace(/^([#>\-+*=|~`_])/, '\\$1')
 
 // parseVerdict validates `file` and `claim` as strings and never `line`, so a
-// missing line reaches here; "src/a.ts:undefined" is not a location.
-const locate = (f) => (Number.isInteger(f.line) ? `${f.file}:${f.line}` : String(f.file ?? ''))
+// missing line reaches here and "src/a.ts:undefined" is not a location. A line
+// the model sent as a string is still a line, though — dropping it makes a real
+// defect harder to find than it needs to be. `> 0` rejects null and '' , which
+// Number() turns into a plausible-looking zero.
+const locate = (f) => {
+  const line = Number(f?.line)
+  return Number.isInteger(line) && line > 0 ? `${f.file}:${line}` : String(f?.file ?? '')
+}
 
 const findingLine = (f) =>
   [
@@ -97,8 +103,16 @@ export function renderReviewBody({ round, summary, blockers, nits = [], resolved
       ''
     )
   }
-  if (resolved.length) {
-    parts.push('### Previously raised', '', resolved.map((r) => `- ${r.resolved ? '✅' : '⬜️'} ${safe(r.claim)}${r.how ? ` — ${safe(r.how)}` : ''}`).join('\n'), '')
+  // parseVerdict checks that previousBlockersResolved is an array and nothing
+  // whatever about its elements, so a `null` or a bare string arrives here. A
+  // throw would lose an otherwise-complete review to the sticky review-error
+  // label that is never auto-retried, and an entry carrying no claim has
+  // nothing to say that could be rendered.
+  const prior = resolved
+    .map((r) => ({ done: Boolean(r?.resolved), claim: safe(r?.claim), how: safe(r?.how) }))
+    .filter((r) => r.claim)
+  if (prior.length) {
+    parts.push('### Previously raised', '', prior.map((r) => `- ${r.done ? '✅' : '⬜️'} ${r.claim}${r.how ? ` — ${r.how}` : ''}`).join('\n'), '')
   }
   if (skippedFiles.length) {
     parts.push(

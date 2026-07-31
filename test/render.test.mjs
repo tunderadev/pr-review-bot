@@ -163,10 +163,30 @@ test('a finding with no line number renders its file, never the word undefined',
   // parseVerdict validates `file` and `claim` as strings and never `line`, so a
   // missing line reaches this module and would otherwise be published.
   const lineless = { file: 'src/a.ts', claim: 'unhandled null', why: 'crash' }
-  const body = renderReviewBody({ round: 1, summary: 's', blockers: [lineless], nits: [], resolved: [], skippedFiles: [], criteriaVersion: 'v' })
+  const body = renderReviewBody({ round: 1, summary: 's', blockers: [lineless, { file: 'src/b.ts', line: null, claim: 'other' }], nits: [], resolved: [], skippedFiles: [], criteriaVersion: 'v' })
   assert.match(section(body, 'Blocking'), /src\/a\.ts/)
   assert.doesNotMatch(body, /undefined/)
+  assert.doesNotMatch(body, /src\/b\.ts:0/, 'a null line is no line, not line zero')
   assert.doesNotMatch(renderChangesRequested({ mentionText: '<@U1>', round: 1, blockers: [lineless], pr: PR }), /undefined/)
+})
+
+test('a line number the model sent as a string still locates the finding', () => {
+  // Nothing upstream types this field, and dropping a location the model did
+  // supply makes a real defect harder to find than it needs to be.
+  const body = renderReviewBody({ round: 1, summary: 's', blockers: [{ file: 'src/a.ts', line: '42', claim: 'unhandled null' }], nits: [], resolved: [], skippedFiles: [], criteriaVersion: 'v' })
+  assert.match(section(body, 'Blocking'), /src\/a\.ts:42/)
+})
+
+test('a malformed previously-raised entry is dropped, and never costs the whole review', () => {
+  // parseVerdict checks that previousBlockersResolved is an array and nothing
+  // whatever about its elements, so `null` and bare strings reach this module.
+  // Throwing here loses an otherwise-complete review to the sticky
+  // review-error label, which is never auto-retried.
+  const body = renderReviewBody({ round: 2, summary: 's', blockers: [], nits: [], resolved: [null, 'old thing', {}, { claim: 'real one', resolved: true, how: 'added guard' }], skippedFiles: [], criteriaVersion: 'v' })
+  const s = section(body, 'Previously raised')
+  assert.match(s, /✅ real one — added guard/)
+  assert.doesNotMatch(body, /undefined|null/)
+  assert.equal(s.split('\n').filter((l) => l.startsWith('- ')).length, 1, 'an entry carrying no claim has nothing to say and renders nothing')
 })
 
 test('no-new-commits reply explains why nothing was reviewed', () => {

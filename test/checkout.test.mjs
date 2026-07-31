@@ -86,3 +86,64 @@ test('the worktree is at the requested SHA, not at the tip of the fetched ref', 
   assert.equal(existsSync(join(wt.dir, 'added-later.js')), false, 'a file added after the requested SHA must not be present')
   await wt.cleanup()
 })
+
+// The fetch is the step this module exists to get right, and the three tests
+// above cannot see it: they all pass an explicit fetchRef pointing at a branch,
+// and cloning from a local path copies the whole object database, so deleting
+// the `git fetch` line outright leaves every one of them green. Against real
+// GitHub that deletion breaks EVERY pr: a PR head commit sits on no branch and
+// refs/pull/* is not advertised to a plain clone, so `worktree add` dies with
+// "invalid reference" before a review ever starts.
+//
+// So this exercises the default refspec — refs/pull/<number>/head, never
+// executed above — and puts the commit into the origin only AFTER the clone
+// exists. No clone-time copying can mask an object that did not exist yet, and
+// the second leg pins the round-2 case: a REUSED clone must still learn about
+// new commits, or every re-review silently reads the previous push's code.
+//
+// GIT_NO_LAZY_FETCH is what makes the assertion mean anything. --filter=blob:none
+// registers origin as a PROMISOR remote, so on a missing object git quietly runs
+// its own fetch behind the module's back — and against a local origin that
+// always succeeds, which is why deleting the module's `git fetch` outright still
+// left this test green until the variable was set. Real git and the real runGit
+// still do all the work here; only git's silent substitution for the step under
+// test is switched off. Without the fetch the worktree add now dies with
+// "fatal: invalid reference", the same error production would raise.
+test('fetches the PR head through the default refs/pull ref, into a reused clone', async (t) => {
+  const origin = makeOrigin()
+  const git = (...a) => execFileSync('git', ['-C', origin.dir, ...a], { stdio: 'pipe' })
+  const clonesDir = tempDir('clones-')
+  const checkouts = createCheckouts({ clonesDir, remoteUrlFor: () => origin.dir })
+  const priorNoLazyFetch = process.env.GIT_NO_LAZY_FETCH
+  process.env.GIT_NO_LAZY_FETCH = '1'
+  t.after(() => {
+    if (priorNoLazyFetch === undefined) delete process.env.GIT_NO_LAZY_FETCH
+    else process.env.GIT_NO_LAZY_FETCH = priorNoLazyFetch
+  })
+
+  // Round 1 creates the clone, back when the origin held only this commit.
+  const first = await checkouts.worktreeForPr({ repo: 'o/r', number: 1, sha: origin.sha, fetchRef: 'refs/heads/main' })
+  await first.cleanup()
+
+  // A PR head, as GitHub exposes one: reachable from no branch, published only
+  // under refs/pull/<number>/head, and created after the clone was taken.
+  git('checkout', '-q', '--detach')
+  writeFileSync(join(origin.dir, 'hotfix.js'), 'export const fixed = true\n')
+  git('add', '.')
+  git('commit', '-qm', 'pr head')
+  const prSha = execFileSync('git', ['-C', origin.dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+  git('update-ref', 'refs/pull/22/head', prSha)
+  git('checkout', '-q', 'main')
+  assert.equal(
+    execFileSync('git', ['-C', origin.dir, 'branch', '--contains', prSha], { encoding: 'utf8' }).trim(),
+    '',
+    'the fixture PR head must be reachable from no branch, like a real one'
+  )
+
+  // No fetchRef: this is the default refs/pull/22/head path Task 13 relies on.
+  const wt = await checkouts.worktreeForPr({ repo: 'o/r', number: 22, sha: prSha })
+  const head = execFileSync('git', ['-C', wt.dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+  assert.equal(head, prSha, 'worktree HEAD must be the PR head fetched via refs/pull/22/head')
+  assert.match(readFileSync(join(wt.dir, 'hotfix.js'), 'utf8'), /fixed = true/)
+  await wt.cleanup()
+})

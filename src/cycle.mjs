@@ -135,10 +135,15 @@ function makeSlackOps({ slack, config, log }) {
       if (!binding?.ts) return
       await attempt('thread reply', ref, () => slack.postThreadReply({ channel: binding.channel, threadTs: binding.ts, text }))
     },
+    // authorMap only. resolveMention still supports an email-lookup tier, but
+    // this caller never had an address to give it — GitHub does not reliably
+    // expose an author's email on a PR payload — so the tier was unreachable
+    // from here while implying a capability the tool does not have.
     async mention(login) {
-      const resolved = await resolveMention({ login, authorMap: config.authorMap, lookupEmail: slack.lookupUserByEmail })
+      const resolved = await resolveMention({ login, authorMap: config.authorMap })
       // An unpingable author is otherwise invisible: the reply still posts, it
-      // just never reaches the one person who has to act on it.
+      // just never reaches the one person who has to act on it. With the email
+      // tier gone this warning is the ONLY thing that surfaces a missing entry.
       if (!resolved.mapped) {
         log(`No Slack member ID for "${login}" — add them to authorMap in team.json so they get pinged.`)
       }
@@ -197,8 +202,46 @@ async function postReviewOrPreserve({ github, pr, event, body, ref }) {
   }
 }
 
+// A dry run is the LIVE path with its mutating calls removed, never a separate
+// branch: a preview that renders through different code is a preview that can
+// disagree with what would actually be posted, and the whole point is to trust
+// it enough to tune review-criteria.md against it. Replacing the methods rather
+// than guarding each call site also means no mutation can survive a forgotten
+// `if (!dryRun)` — the functions that would mutate are simply not present.
+//
+// createReview is where the preview is emitted, because that is the exact call
+// that would publish: whatever reaches this stub is byte-for-byte what GitHub
+// would have received.
+function previewGitHub(github, log) {
+  return {
+    ...github,
+    createReview: async (repo, number, { event, body }) => {
+      log(`\n[dry-run] ${repo}#${number} — would post ${event}:\n\n${body}\n`)
+      return { html_url: null }
+    },
+    createIssueComment: async () => ({ id: 0 }),
+    updateIssueComment: async (repo, id) => ({ id }),
+    addLabel: async () => {},
+    removeLabel: async () => {},
+  }
+}
+
+// Every method a no-op, and postMessage deliberately returns no `ts`: that is
+// what makes announce() yield a null binding, so nothing downstream threads,
+// reacts, or writes a Slack binding into the ledger.
+function previewSlack() {
+  return {
+    postMessage: async () => ({}),
+    postThreadReply: async () => ({}),
+    addReaction: async () => ({}),
+    removeReaction: async () => ({}),
+  }
+}
+
 export async function runCycle({ config, deps, dryRun = false, now = new Date().toISOString() }) {
-  const { github, slack, checkouts, runReview, refuteBlockers, telemetry, botLogin, log } = deps
+  const { checkouts, runReview, refuteBlockers, telemetry, botLogin, log } = deps
+  const github = dryRun ? previewGitHub(deps.github, log) : deps.github
+  const slack = dryRun ? previewSlack() : deps.slack
   const slackOps = makeSlackOps({ slack, config, log })
   const criteriaVersion = criteriaVersionOf(config.criteria)
   const processed = []
@@ -214,13 +257,23 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
   // maxPerCycle labelled PRs starves every repo listed after it, permanently.
   candidates.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
 
-  for (const pr of candidates.slice(0, config.maxPerCycle)) {
+  const selected = candidates.slice(0, config.maxPerCycle)
+
+  // Said BEFORE the first model call, never after: a warning that arrives once
+  // the money is spent is not a warning. A dry run makes the identical calls a
+  // live review does, against the operator's own Claude subscription.
+  if (dryRun && selected.length) {
+    log(`[dry-run] ${selected.length} PR(s) would be reviewed:`)
+    for (const pr of selected) log(`  ${pr.repo}#${pr.number} (${pr.headSha.slice(0, 7)}) "${pr.title}"`)
+    log(
+      `[dry-run] Reviewing them now for real: same prompts, same criteria, same model calls, ` +
+        `so this spends the same Claude subscription quota a live review does. ` +
+        `Nothing is posted, labelled, or mirrored to Slack — each review is printed below instead.`
+    )
+  }
+
+  for (const pr of selected) {
     const ref = `${pr.repo}#${pr.number}`
-    if (dryRun) {
-      log(`[dry-run] would review ${ref} (${pr.headSha.slice(0, 7)}) "${pr.title}"`)
-      processed.push({ repo: pr.repo, number: pr.number, outcome: 'dry_run' })
-      continue
-    }
 
     let claimed = false
     let worktree = null
@@ -244,10 +297,20 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       const round = state.rounds.length + 1
 
       if (alreadyReviewedSha(reviews, botLogin, pr.headSha)) {
-        await slackOps.reply(binding, renderNoNewCommits({ round: state.rounds.length }), ref)
-        await github.removeLabel(pr.repo, pr.number, config.labels.requested)
-        processed.push({ repo: pr.repo, number: pr.number, outcome: 'skipped_same_sha' })
-        continue
+        // The one place a dry run deliberately diverges from the live path.
+        // Re-running against a PR that was already reviewed IS the criteria
+        // tuning loop — edit the criteria, re-run, read the output — and the
+        // skip exists only to avoid posting a duplicate review, which a dry
+        // run cannot do. Honouring it here would leave the operator able to
+        // preview only PRs the bot has never seen, which is the opposite of
+        // the ones they want to check.
+        if (!dryRun) {
+          await slackOps.reply(binding, renderNoNewCommits({ round: state.rounds.length }), ref)
+          await github.removeLabel(pr.repo, pr.number, config.labels.requested)
+          processed.push({ repo: pr.repo, number: pr.number, outcome: 'skipped_same_sha' })
+          continue
+        }
+        log(`[dry-run] ${ref} was already reviewed at ${pr.headSha.slice(0, 7)}, so a live cycle would skip it. Previewing anyway.`)
       }
 
       // Claimed before ANY expensive work — before the diff, the checkout, the
@@ -336,7 +399,7 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       }) })
 
       await github.removeLabel(pr.repo, pr.number, config.labels.inProgress)
-      processed.push({ repo: pr.repo, number: pr.number, outcome: 'reviewed', verdict: name })
+      processed.push({ repo: pr.repo, number: pr.number, outcome: dryRun ? 'dry_run' : 'reviewed', verdict: name })
     } catch (error) {
       const transient = isTransientFailure(error)
       // Whatever went wrong, the run is over: nothing else in the cycle may

@@ -14,21 +14,26 @@ If the clone lives somewhere else, change the path and nothing else. Add no flag
 
 ## 2. Report the outcome in at most three lines
 
-A run that reached the end prints one summary line last. Most cycles find nothing, and that is a
-healthy result, not a problem to investigate:
+A run that reached the end prints one line per processed PR, then the totals as the **last** line.
+Most cycles find nothing, and that is a healthy result, not a problem to investigate:
 
 ```
 0 PR(s): none
-2 PR(s): 1 reviewed, 1 skipped_same_sha
 ```
 
-It counts outcomes; it does **not** name verdicts. The outcome words this command can produce are
-`reviewed`, `skipped_same_sha` and `error` — so `1 reviewed` does not tell you whether that PR was
-approved or asked for changes. Never fill that in from imagination; the PR page and the ledger
-comment have the answer.
+```
+owner/repo#12 reviewed (approved)
+owner/repo#14 reviewed (changes_requested)
+owner/repo#9 skipped_same_sha
+3 PR(s): 2 reviewed, 1 skipped_same_sha
+```
 
-Lines printed **above** the summary are per-PR and each names its `owner/repo#number`. That is
-the only place a specific PR appears, so pass those through:
+Each per-PR line is `owner/repo#number <outcome>`, with the verdict in parentheses when there is
+one. The outcomes are `reviewed`, `skipped_same_sha` and `error`; the verdicts are `approved` and
+`changes_requested`. Report them as printed — they are the answer, so you never need to open a PR
+page, and never fill in a verdict that was not printed.
+
+Other lines may appear **above** those, emitted by the cycle while it works. Pass them through too:
 
 - `owner/repo#12 deferred: …` — transient, the PR is back under `review-requested`, next cycle retries it.
 - `owner/repo#12 failed: …` — per-PR failure, the PR now wears `review-error`.

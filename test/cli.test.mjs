@@ -551,6 +551,55 @@ test('a clean cycle exits 0 and summarises the outcomes', async () => {
   assert.match(stdout(out), /1 skipped_same_sha/)
 })
 
+test('the summary names each PR and its verdict, then the totals', async () => {
+  // Counts alone cannot tell an operator which PR was approved and which needs
+  // changes, so /pr-watch had to send them to GitHub to find out.
+  const { opts, out } = harness({
+    cycle: async () => ({
+      processed: [
+        { repo: 'acme/api', number: 12, outcome: 'reviewed', verdict: 'approved' },
+        { repo: 'acme/web', number: 3, outcome: 'reviewed', verdict: 'changes_requested' },
+        { repo: 'acme/api', number: 9, outcome: 'skipped_same_sha' },
+        { repo: 'acme/web', number: 4, outcome: 'error' },
+      ],
+      aborted: false,
+    }),
+  })
+  assert.equal(await main([], opts), EXIT.prFailures)
+  const lines = stdout(out).split('\n')
+  assert.ok(lines.includes('acme/api#12 reviewed (approved)'), stdout(out))
+  assert.ok(lines.includes('acme/web#3 reviewed (changes_requested)'), stdout(out))
+  assert.ok(lines.includes('acme/api#9 skipped_same_sha'), 'an outcome with no verdict carries no empty parens')
+  assert.ok(lines.includes('acme/web#4 error'), stdout(out))
+  // The per-PR lines come first so the totals stay the LAST line, which is what
+  // the slash command reads.
+  assert.match(lines.at(-1), /^4 PR\(s\): 2 reviewed, 1 skipped_same_sha, 1 error$/)
+})
+
+test('a dry run names the PRs it previewed', async () => {
+  const { opts, out } = harness({
+    cycle: async () => ({ processed: [{ repo: 'acme/api', number: 12, outcome: 'dry_run', verdict: 'changes_requested' }], aborted: false }),
+  })
+  assert.equal(await main(['cycle', '--dry-run'], opts), EXIT.ok)
+  assert.ok(stdout(out).split('\n').includes('acme/api#12 dry_run (changes_requested)'), stdout(out))
+})
+
+test('--json still emits only the structured result, with no per-PR prose', async () => {
+  const { opts, out } = harness({
+    cycle: async () => ({
+      processed: [
+        { repo: 'acme/api', number: 12, outcome: 'reviewed', verdict: 'approved' },
+        { repo: 'acme/web', number: 4, outcome: 'error' },
+      ],
+      aborted: false,
+    }),
+  })
+  assert.equal(await main(['cycle', '--json'], opts), EXIT.prFailures)
+  const parsed = JSON.parse(stdout(out))
+  assert.equal(parsed.processed[0].verdict, 'approved')
+  assert.equal(parsed.processed.length, 2)
+})
+
 test('a transient abort exits 3, distinct from a per-PR failure', async () => {
   // runCycle pushes an `error` outcome for the PR it deferred AND sets
   // aborted, so a scheme that checked errors first would report every

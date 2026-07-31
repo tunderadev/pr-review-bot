@@ -434,11 +434,17 @@ export async function main(argv, options = {}) {
 
     const counts = result.processed.reduce((acc, p) => ({ ...acc, [p.outcome]: (acc[p.outcome] || 0) + 1 }), {})
     const outcomes = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ') || 'none'
-    log(
-      json
-        ? JSON.stringify(result, null, 2)
-        : `${result.processed.length} PR(s): ${outcomes}${result.aborted ? ` — aborted: ${result.reason}` : ''}`
-    )
+    if (json) {
+      log(JSON.stringify(result, null, 2))
+    } else {
+      // One line per PR, before the totals. Counts alone cannot say WHICH PR
+      // was approved and which needs changes, so a reader had to open GitHub to
+      // find out. The totals stay LAST, where the slash command reads them.
+      for (const p of result.processed) {
+        log(`${p.repo}#${p.number} ${p.outcome}${p.verdict ? ` (${p.verdict})` : ''}`)
+      }
+      log(`${result.processed.length} PR(s): ${outcomes}${result.aborted ? ` — aborted: ${result.reason}` : ''}`)
+    }
 
     // Order matters. runCycle records an `error` outcome for the PR it deferred
     // AND sets aborted, so checking failures first would report every transient

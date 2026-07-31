@@ -354,17 +354,92 @@ test('pagination truncation is named, never silent', async () => {
   assert.match(bodyOf(actions), /pagination/i)
 })
 
+// Every verb makeDeps can record that changes something outside this process.
+// Asserting against the complement — the set a dry run IS allowed to perform —
+// means any action added later has to be classified deliberately instead of
+// slipping through a list of known-bad names nobody updated.
+const DRY_RUN_ALLOWED = ['cleanup', 'files', 'refute-call', 'review-call', 'worktree']
+const MUTATIONS = ['add-label', 'remove-label', 'review', 'comment', 'update-comment', 'slack-post', 'slack-thread', 'react-add', 'react-remove']
+
 test('dry run mutates nothing', async () => {
   const { deps, actions, calls } = makeDeps()
   const out = await runCycle({ config, deps, dryRun: true, now: NOW })
   assert.equal(out.processed[0].outcome, 'dry_run')
-  // Not "no labels": no action of any kind, including the reads that cost
-  // money — no checkout, no model call, no telemetry row.
-  assert.deepEqual(actions, [], 'dry run must touch nothing at all')
-  assert.equal(calls.review.length, 0)
-  assert.equal(calls.refute.length, 0)
-  assert.equal(calls.worktree.length, 0)
-  assert.equal(calls.telemetry.length, 0)
+  // The review itself now runs — that is the point of a dry run — so this can
+  // no longer be "no actions at all". It is the stronger claim: nothing that
+  // reaches GitHub or Slack, whatever else happened.
+  assert.deepEqual([...new Set(actions.map((a) => a[0]))].sort(), DRY_RUN_ALLOWED, 'a dry run performed something outside the read path')
+  for (const verb of MUTATIONS) {
+    assert.equal(named(actions, verb).length, 0, `dry run performed "${verb}"`)
+  }
+})
+
+test('dry run runs the real review and prints the body it would have posted', async () => {
+  // Without this a dry run cannot tune review-criteria.md, which is the only
+  // reason it exists: the alternative is posting real reviews on colleagues'
+  // PRs and iterating in public.
+  const { deps, calls, logs } = makeDeps({
+    runReview: async () => ({ verdict: okVerdict({ findings: [blocking()] }), runs: [RUN] }),
+  })
+  const out = await runCycle({ config, deps, dryRun: true, now: NOW })
+
+  assert.equal(calls.review.length, 1, 'the review must actually run')
+  assert.equal(calls.refute.length, 1, 'the refutation pass must actually run')
+  assert.equal(calls.worktree.length, 1, 'the model needs the checkout to read real files')
+  assert.equal(calls.review[0].criteria, 'be careful', 'the criteria under test are the ones that ran')
+
+  const printed = logs.join('\n')
+  assert.match(printed, /REQUEST_CHANGES/, 'the verdict it would post is named')
+  assert.match(printed, /🔧 Changes requested — Round 1/, 'the rendered review body is printed')
+  assert.match(printed, /unhandled null/, 'the findings are printed')
+  assert.deepEqual(out.processed, [{ repo: 'o/r', number: 7, outcome: 'dry_run', verdict: 'changes_requested' }])
+})
+
+test('dry run says up front that it spends the same quota a live review does', async () => {
+  // A preview that silently bills the operator's subscription is a surprise on
+  // their usage page, and this one runs the identical model calls.
+  const { deps, logs } = makeDeps()
+  await runCycle({ config, deps, dryRun: true, now: NOW })
+  const printed = logs.join('\n')
+  assert.match(printed, /quota/i, `no cost warning in ${JSON.stringify(logs)}`)
+  assert.match(printed, /would be reviewed/i, 'the "would review" listing is still there')
+  assert.match(printed, /o\/r#7/, 'the listing names the PR')
+  // The warning is worthless after the money is spent.
+  const warned = logs.findIndex((m) => /quota/i.test(m))
+  const reviewed = logs.findIndex((m) => /Round 1/.test(m))
+  assert.ok(warned !== -1 && (reviewed === -1 || warned < reviewed), 'the cost warning must precede the model call')
+})
+
+test('dry run records telemetry, because the cost was genuinely incurred', async () => {
+  const { deps, calls } = makeDeps()
+  await runCycle({ config, deps, dryRun: true, now: NOW })
+  assert.ok(calls.telemetry.length > 0, 'a dry run spends real quota and must be measurable')
+  assert.equal(calls.telemetry[0].repo, 'o/r')
+  assert.equal(calls.telemetry[0].phase, 'review')
+})
+
+test('dry run previews a PR the live cycle would skip for having the same head SHA', async () => {
+  // Re-running against an already-reviewed PR IS the criteria tuning loop. If
+  // the dry run honoured the same-SHA skip, the only previewable PRs would be
+  // ones the bot has never seen.
+  const { deps, calls, logs } = makeDeps({
+    github: { listReviews: async () => [{ user: { login: BOT }, commit_id: 'abc1234', state: 'APPROVED', submitted_at: NOW }] },
+  })
+  const out = await runCycle({ config, deps, dryRun: true, now: NOW })
+  assert.equal(calls.review.length, 1, 'the preview still runs')
+  assert.equal(out.processed[0].outcome, 'dry_run')
+  assert.match(logs.join('\n'), /already reviewed|would skip/i, 'but the operator is told a live cycle would skip it')
+})
+
+test('dry run applies no label when the review fails', async () => {
+  const { deps, actions } = makeDeps({
+    runReview: async () => { throw new FatalError('model exploded') },
+  })
+  const out = await runCycle({ config, deps, dryRun: true, now: NOW })
+  assert.equal(out.processed[0].outcome, 'error')
+  assert.equal(named(actions, 'add-label', 'review-error').length, 0, 'a preview must not strand a real PR on the sticky label')
+  assert.deepEqual(named(actions, 'add-label'), [])
+  assert.deepEqual(named(actions, 'remove-label'), [])
 })
 
 test('closed PR is skipped without review', async () => {
@@ -435,14 +510,21 @@ test('refutation gets a five-minute budget; the review keeps its own default', a
   assert.equal(calls.refute[0].cwd, '/wt', 'the refuter reads the same checkout the review did')
 })
 
-test('an author with no Slack mapping is named in a warning', async () => {
+test('an author with no Slack mapping is named in a warning, and no email lookup is attempted', async () => {
+  // The authorMap -> email-lookup -> unlinked-text chain never had a middle
+  // tier here: the cycle passed `lookupEmail` but never an `email`, and GitHub
+  // does not reliably expose one on a PR payload. With that wiring gone, this
+  // warning is the ONLY thing that tells an operator their authorMap is short
+  // an entry.
+  const lookups = []
   const { deps, actions, logs } = makeDeps({
     runReview: async () => ({ verdict: okVerdict({ findings: [blocking()] }), runs: [RUN] }),
+    slack: { lookupUserByEmail: async (email) => { lookups.push(email); return 'U-should-not-be-used' } },
   })
   await runCycle({ config: { ...config, authorMap: {} }, deps, now: NOW })
-  // Without this the author is simply never pinged and nobody finds out.
   assert.ok(logs.some((m) => m.includes('octocat')), `no warning naming the author in ${JSON.stringify(logs)}`)
   assert.match(actions.find((a) => a[0] === 'slack-thread')[1], /@octocat/)
+  assert.deepEqual(lookups, [], 'the dead email tier must not be reachable')
 })
 
 test('a Slack reaction failure never prevents the GitHub review', async () => {

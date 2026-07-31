@@ -17,7 +17,9 @@ test('mintAppJwt produces a verifiable RS256 JWT with GitHub-required claims', (
   const payload = JSON.parse(Buffer.from(p, 'base64url').toString())
   assert.equal(payload.iss, '12345')
   assert.equal(payload.iat, NOW - 60, 'iat is backdated to tolerate clock skew')
-  assert.ok(payload.exp > payload.iat, 'exp must be after iat — a pre-expired token is rejected on arrival')
+  // Comparing exp to iat is vacuous: iat is itself backdated 60s, so an exp
+  // already in the past still clears it. The token must outlive NOW.
+  assert.ok(payload.exp > NOW, 'token must not be born expired')
   assert.ok(payload.exp - NOW <= 600, 'exp must be within GitHub 10-minute ceiling')
   assert.ok(createVerify('RSA-SHA256').update(`${h}.${p}`).verify(publicKey, Buffer.from(s, 'base64url')))
 })
@@ -46,4 +48,24 @@ test('getInstallationToken surfaces a readable error on failure', async () => {
 test('getBotLogin derives the [bot] login from the app slug', async () => {
   const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ slug: 'plat-reviewer' }) })
   assert.equal(await getBotLogin({ appId: 1, privateKeyPem: privateKey, nowSeconds: NOW, fetchImpl }), 'plat-reviewer[bot]')
+})
+
+test('getBotLogin refuses a 200 response with no slug', async () => {
+  // "undefined[bot]" matches no author, so findSticky and alreadyReviewedSha
+  // would fail forever: a fresh sticky comment and a duplicate review per cycle.
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ id: 42 }) })
+  await assert.rejects(getBotLogin({ appId: 1, privateKeyPem: privateKey, nowSeconds: NOW, fetchImpl }), /slug/)
+})
+
+test('mintAppJwt coerces a numeric-string nowSeconds instead of concatenating it', () => {
+  const jwt = mintAppJwt({ appId: 1, privateKeyPem: privateKey, nowSeconds: String(NOW) })
+  const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString())
+  assert.equal(payload.iat, NOW - 60)
+  assert.equal(payload.exp, NOW + 540, 'string + 540 concatenates to a timestamp ~57,000 years out')
+})
+
+test('mintAppJwt rejects a nowSeconds that is not a finite number', () => {
+  for (const nowSeconds of [undefined, null, NaN, Infinity, 'not-a-number', {}]) {
+    assert.throws(() => mintAppJwt({ appId: 1, privateKeyPem: privateKey, nowSeconds }), /nowSeconds/, `accepted ${String(nowSeconds)}`)
+  }
 })

@@ -137,7 +137,7 @@ test('validateConfig reports type problems together, not one per run', () => {
 
 test('assertNoSecrets rejects token-shaped values and secret-shaped keys', () => {
   assert.throws(() => assertNoSecrets({ ...VALID, slackBotToken: 'xoxb-' + '1-2-abc' }), /slackBotToken/)
-  assert.throws(() => assertNoSecrets({ ...VALID, nested: { deep: 'ghp_aaaaaaaaaaaa' } }), /nested\.deep/)
+  assert.throws(() => assertNoSecrets({ ...VALID, nested: { deep: 'ghp_aaaaaaaaaaaabbbbbbbbbbbbcccccccccccc' } }), /nested\.deep/)
   assert.doesNotThrow(() => assertNoSecrets(VALID))
 })
 
@@ -149,7 +149,9 @@ test('assertNoSecrets finds a credential anywhere in the value, not only at posi
     '  ghp_0123456789abcdefghij',
     'use ghp_0123456789abcdefghij to test',
     'export SLACK=xoxb-1-2-abcdef',
-    'run with sk-abcdef0123456789',
+    'run with sk-abcdef0123456789abcdef0123456789',
+    'run with sk-proj-abcdef0123456789abcdef0123456789',
+    'github_pat_11ABCDEFG0abcdefghijklmnop',
     'key is\n-----BEGIN RSA PRIVATE KEY-----',
   ]
   for (const value of leaks) {
@@ -169,6 +171,40 @@ test('assertNoSecrets does not flag ordinary config values', () => {
   assert.doesNotThrow(() =>
     assertNoSecrets({ ...VALID, repos: ['acme/task-runner'], clonesDir: '/home/me/.cache/path', titlePattern: 'x', path: '/tmp' })
   )
+})
+
+test('a bare credential prefix in an ordinary value is not a credential', () => {
+  // A prefix alone is not a leak. Rejecting one hard-fails startup on day one
+  // with a message accusing the team of committing a secret — over a SvelteKit
+  // repo name or a cache directory.
+  const ordinary = [
+    ['repos', ['acme/sk-tools']],
+    ['clonesDir', '/home/me/sk-clones'],
+    ['clonesDir', '/home/me/sk-cache-of-review-clones'],
+    ['note', 'see the sk- prefixed repos'],
+    ['note', 'gho_ is the OAuth prefix'],
+  ]
+  for (const [key, value] of ordinary) {
+    assert.doesNotThrow(
+      () => assertNoSecrets({ ...VALID, [key]: value }),
+      `rejected ordinary value ${key}=${JSON.stringify(value)}`
+    )
+  }
+})
+
+test('ordinary keys that merely contain "pat" are not secret-shaped', () => {
+  for (const key of ['PAT_DIRS', 'pat_dirs', 'patStrategy', 'pats', 'patch', 'path']) {
+    assert.doesNotThrow(() => assertNoSecrets({ ...VALID, [key]: 'x' }), `rejected ordinary key "${key}"`)
+  }
+})
+
+test('assertNoSecrets catches a credential glued to a preceding word character', () => {
+  // A word boundary before the prefix cannot fire after a word character, so
+  // exactly the shapes a .env dump produces would have slipped through.
+  const leaks = ['SLACK_TOKEN_xoxb-1-2-abcdef', 'prefix_ghp_0123456789abcdefghij', 'GITHUB_TOKEN=ghs_0123456789abcdefghij']
+  for (const value of leaks) {
+    assert.throws(() => assertNoSecrets({ ...VALID, note: value }), /"note"/, `leaked ${JSON.stringify(value)}`)
+  }
 })
 
 test('loadConfig reads files, validates, and attaches criteria and configDir', () => {

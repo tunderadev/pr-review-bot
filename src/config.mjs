@@ -8,17 +8,42 @@ export const CRITERIA_FILENAME = 'review-criteria.md'
 // Matched against the key with separators removed, so api_key / api-key /
 // apiKey all normalize to the same spelling.
 const SECRET_KEY_RE = /token|secret|password|privatekey|apikey|credential/
-// "pat" needs token boundaries: bare substring matching would flag path,
-// patch, and titlePattern.
 const KEY_TOKEN_SPLIT = /[^a-zA-Z0-9]+|(?<=[a-z0-9])(?=[A-Z])/
-const SECRET_KEY_TOKENS = new Set(['pat', 'pats'])
-// Unanchored: credentials get pasted mid-string ("Bearer ghs_…", "use ghp_… to
-// test") or with leading whitespace. \b keeps "sk-" from matching "task-".
-const SECRET_VALUE_RE = /\b(xox[baprs]-|ghp_|gho_|ghs_|ghu_|github_pat_|sk-)|-----BEGIN/
+// Unanchored, because credentials get pasted mid-string ("Bearer ghs_…",
+// "use ghp_… to test"), with leading whitespace, or glued to a preceding word
+// ("SLACK_TOKEN_xoxb-…") — a \b before the prefix cannot fire after a word
+// character, so it missed exactly the shapes a .env dump produces.
+//
+// Every prefix therefore demands a plausible secret BODY rather than the bare
+// prefix. A prefix alone is not a leak, and rejecting one hard-fails startup
+// with a message accusing the team of committing a credential — over a
+// SvelteKit repo name ("acme/sk-tools") or a cache path ("/home/me/sk-clones").
+// Real tokens are long unbroken alphanumeric runs; human-readable names are
+// short segments joined by separators, which is what tells them apart.
+const SECRET_VALUE_RE = new RegExp(
+  [
+    // Slack: xoxb-<workspace>-<id>-<secret>. No non-credential string contains
+    // "xox", so the body only has to be more than a mention of the prefix.
+    'xox[baprs]-[A-Za-z0-9-]{10,}',
+    // GitHub: ghp_/gho_/ghs_/ghu_/ghr_ plus 36 alphanumerics; fine-grained PATs
+    // are github_pat_ plus a much longer alphanumeric/underscore body.
+    'gh[posur]_[A-Za-z0-9]{20,}',
+    'github_pat_[A-Za-z0-9_]{20,}',
+    // Model-provider keys: sk-, sk-proj-, sk-ant-api03- … then a long
+    // alphanumeric run. Hyphenated words never reach the run length, so
+    // "sk-clones" and "sk-cache-of-review-clones" are ordinary strings.
+    'sk-(?:[A-Za-z0-9]+-)*[A-Za-z0-9]{20,}',
+    '-----BEGIN',
+  ].join('|')
+)
 
 function isSecretShapedKey(key) {
   if (SECRET_KEY_RE.test(key.toLowerCase().replace(/[^a-z]/g, ''))) return true
-  return key.split(KEY_TOKEN_SPLIT).some((part) => SECRET_KEY_TOKENS.has(part.toLowerCase()))
+  // A key that ENDS in "pat" names a personal access token (pat, githubPat,
+  // github_pat). A leading "pat" is a word fragment — patStrategy, pat_dirs,
+  // PAT_DIRS, patch, path — and rejecting those hard-fails startup.
+  const tokens = key.split(KEY_TOKEN_SPLIT).filter(Boolean)
+  return tokens.at(-1)?.toLowerCase() === 'pat'
 }
 
 export function resolveConfigDir({ flag, env, cwd = process.cwd(), home = homedir(), exists = existsSync }) {

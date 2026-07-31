@@ -36,6 +36,22 @@ const PERMISSION_RANK = { none: 0, read: 1, write: 2, admin: 3 }
 // last line before a live credential enters git history, where it stays.
 const SECRET_FILES = ['.env', '.env.local']
 
+// `--version` only. It resolves the binary and prints a string; it starts no
+// session and makes no model call, so it costs nothing. Probing with
+// `claude -p` would spend the operator's subscription quota to find out
+// whether their subscription quota works, which is the wrong trade for a
+// preflight that is supposed to be cheap.
+const PROBE_TIMEOUT_MS = 10_000
+
+function defaultClaudeCli() {
+  const path = execFileSync('/bin/sh', ['-c', 'command -v claude'], { encoding: 'utf8', stdio: 'pipe', timeout: PROBE_TIMEOUT_MS }).trim()
+  if (!path) throw new Error('`command -v claude` resolved nothing')
+  // Executed by resolved path, so the version reported belongs to the binary
+  // the check just named — not to a different `claude` earlier on PATH.
+  const version = execFileSync(path, ['--version'], { encoding: 'utf8', stdio: 'pipe', timeout: PROBE_TIMEOUT_MS }).trim()
+  return { path, version }
+}
+
 // Answers only "is git tracking this path right now". A config dir outside any
 // repository and a machine with no git installed both answer false, which is
 // the right answer for the first and an unprovable one for the second — a
@@ -89,6 +105,8 @@ function safeResolve(path) {
  *   permissions the installation was granted. A token string cannot answer
  *   any of that, so whoever built the client has to say.
  * @param configSource optional label for the tier that produced configDir.
+ * @param claudeCli probe returning `{version, path?}` for the `claude` binary,
+ *   or throwing if it cannot be resolved. Defaults to a `--version` call.
  */
 export async function runDoctor({
   config,
@@ -98,6 +116,7 @@ export async function runDoctor({
   slack,
   env = process.env,
   gitTracked = defaultGitTracked,
+  claudeCli = defaultClaudeCli,
   appAuth,
 }) {
   const checks = []
@@ -113,6 +132,8 @@ export async function runDoctor({
         `Run \`unset ${redirects.map(([name]) => name).join(' ')}\` in the shell that starts the bot.`
       : 'No ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX — headless reviews draw on your Claude subscription.'
   )
+
+  await addClaudeCliCheck(add, claudeCli)
 
   add('config dir', true, describeConfigDir({ configDir, configSource, env }))
 
@@ -192,6 +213,38 @@ export async function runDoctor({
   )
 
   return { checks, ok: checks.every((c) => c.ok) }
+}
+
+// Every review in this system is a `claude -p` subprocess. If the binary is
+// not on the PATH the bot actually runs under — and a launchd or cron PATH is
+// not the operator's interactive shell — then every PR fails identically and
+// each one lands a sticky review-error label a human has to clear by hand.
+// One line here replaces all of that.
+async function addClaudeCliCheck(add, claudeCli) {
+  let info = null
+  let failure = null
+  try {
+    info = await claudeCli()
+  } catch (e) {
+    failure = e.message
+  }
+  if (!info || !info.version) {
+    add(
+      'claude cli',
+      false,
+      `\`claude\` could not be resolved${failure ? `: ${failure}` : ' — the probe returned no version'}. ` +
+        `Every review runs as a \`claude -p\` subprocess, so no PR can be reviewed without it. Install Claude Code, then check the PATH the bot runs under — ` +
+        `a launchd/cron PATH is not your interactive shell's, so \`which claude\` succeeding in a terminal does not settle it.`
+    )
+    return
+  }
+  add(
+    'claude cli',
+    true,
+    `${info.version}${info.path ? ` at ${info.path}` : ''} — the binary is present and executable. ` +
+      `This does not prove you are logged in: doctor makes no model call, because spending subscription quota to test whether subscription quota works is the wrong trade for a preflight. ` +
+      `The first live cycle is what proves authentication.`
+  )
 }
 
 // The expensive failure. A misconfigured credential — most often a personal

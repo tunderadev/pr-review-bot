@@ -25,10 +25,16 @@ const APP_AUTH = {
 // asserted the opposite of what it was written to prove. The stub is the fix,
 // not the implementation: doctor MUST exercise add and remove, because
 // reactions:write is a separate scope and reconciliation is load-bearing.
+// Injected into every case, the brief's six included: doctor's default probe
+// shells out to the real `claude`, and a suite that runs whatever happens to be
+// installed on the machine is testing the machine, not the code.
+const CLAUDE_CLI = async () => ({ version: '2.0.14 (Claude Code)', path: '/usr/local/bin/claude' })
+
 const happy = {
   github: { listOpenPrs: async () => [], ensureLabel: async () => ({}) },
   slack: { postMessage: async () => ({ ts: '1' }), addReaction: async () => ({}), removeReaction: async () => ({}) },
   appAuth: async () => APP_AUTH,
+  claudeCli: CLAUDE_CLI,
 }
 
 const find = (r, name) => r.checks.find((c) => c.name === name)
@@ -58,6 +64,7 @@ function deps(over = {}) {
       env: over.env ?? {},
       gitTracked: over.gitTracked ?? (() => false),
       appAuth: 'appAuth' in over ? over.appAuth : async () => APP_AUTH,
+      claudeCli: over.claudeCli ?? CLAUDE_CLI,
       github,
       slack,
     },
@@ -90,7 +97,7 @@ test('fails when a .env sits inside a git-tracked config dir', async () => {
 
 test('reports repo access failure per repo', async () => {
   const r = await runDoctor({
-    config, configDir: '/cfg', env: {}, gitTracked: () => false, appAuth: happy.appAuth,
+    config, configDir: '/cfg', env: {}, gitTracked: () => false, appAuth: happy.appAuth, claudeCli: CLAUDE_CLI,
     github: { listOpenPrs: async () => { throw new Error('Resource not accessible by integration') }, ensureLabel: async () => ({}) },
     slack: happy.slack,
   })
@@ -148,6 +155,57 @@ test('the auth check names both offenders when both are set', async () => {
   const { detail } = find(r, 'claude auth mode')
   assert.match(detail, /ANTHROPIC_API_KEY/)
   assert.match(detail, /CLAUDE_CODE_USE_BEDROCK/)
+})
+
+// ---------------------------------------------------------------------------
+// Is the `claude` binary there at all?
+// ---------------------------------------------------------------------------
+
+test('a resolved claude binary reports its version and refuses to claim you are logged in', async () => {
+  const { args } = deps()
+  const r = await runDoctor(args)
+  const check = find(r, 'claude cli')
+  assert.equal(check.ok, true)
+  assert.match(check.detail, /2\.0\.14/, 'the version proves the binary ran, not merely that a file exists')
+  assert.match(check.detail, /\/usr\/local\/bin\/claude/, 'name WHICH claude was found — the launchd PATH is the whole point')
+  assert.match(check.detail, /does not prove you are logged in/i, 'presence is not authentication, and the detail must say so')
+  assert.equal(r.ok, true)
+})
+
+test('a claude that is not on PATH is a hard failure that sinks the run', async () => {
+  const { args } = deps({
+    claudeCli: async () => { throw new Error('spawnSync /bin/sh ENOENT') },
+  })
+  const r = await runDoctor(args)
+  const check = find(r, 'claude cli')
+  assert.equal(check.ok, false)
+  assert.match(check.detail, /claude/)
+  assert.match(check.detail, /PATH/, 'name PATH: the binary is usually installed, just not visible to launchd or cron')
+  assert.match(check.detail, /ENOENT/, 'keep the probe\'s own error, so a permissions failure is not misreported as a missing install')
+  // Without it, every PR fails identically and each one leaves a sticky
+  // review-error label for a human to clear. "All good" here is the exact
+  // outcome this check exists to prevent.
+  assert.equal(r.ok, false)
+  assert.deepEqual(failedNames(r), ['claude cli'])
+})
+
+test('a probe that answers without a version is not a working binary', async () => {
+  for (const claudeCli of [async () => null, async () => ({ path: '/usr/local/bin/claude' })]) {
+    const r = await runDoctor(deps({ claudeCli }).args)
+    assert.equal(find(r, 'claude cli').ok, false)
+    assert.equal(r.ok, false)
+  }
+})
+
+test('doctor spends no model quota to check the model runner', async () => {
+  // A `claude -p` probe would draw on the same subscription that funds the
+  // reviews. The check gets exactly one call, and the suite asserts the shape
+  // of it rather than trusting the comment above it.
+  const invocations = []
+  const { args } = deps({ claudeCli: async (...a) => { invocations.push(a); return { version: '2.0.14' } } })
+  await runDoctor(args)
+  assert.equal(invocations.length, 1)
+  assert.deepEqual(invocations[0], [], 'the probe takes no prompt, because there is no prompt to run')
 })
 
 // ---------------------------------------------------------------------------

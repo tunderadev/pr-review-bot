@@ -101,6 +101,12 @@ test('a transport failure no retry can clear is fatal, not an endless retry', as
     ['expired certificate', new TypeError('fetch failed', { cause: { code: 'CERT_HAS_EXPIRED' } }), /CERT_HAS_EXPIRED/],
     ['buggy wrapper', new ReferenceError('fetchImpl is not defined'), /fetchImpl is not defined/],
     ['aborted request', Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }), /aborted/],
+    // Every other UND_ERR_ is a timeout, a reset or a closed socket, so the
+    // classifier treats the prefix as retryable. These two report a bad
+    // ARGUMENT and are as deterministic as a typo: without an explicit
+    // exclusion they inherit that prefix and retry every cycle, forever.
+    ['undici bad argument', new TypeError('fetch failed', { cause: { code: 'UND_ERR_INVALID_ARG' } }), /UND_ERR_INVALID_ARG/],
+    ['undici unsupported', new TypeError('fetch failed', { cause: { code: 'UND_ERR_NOT_SUPPORTED' } }), /UND_ERR_NOT_SUPPORTED/],
   ]
   for (const [what, err, messageRe] of permanent) {
     const fetchImpl = async () => {

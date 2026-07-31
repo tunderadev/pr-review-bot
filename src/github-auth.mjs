@@ -31,7 +31,14 @@ export async function getInstallationToken({ appId, privateKeyPem, installationI
   })
   if (!res.ok) throw new Error(`Installation token request failed (${res.status}): ${await res.text()}`)
   const body = await res.json()
-  return { token: body.token, expiresAt: body.expires_at }
+  // `permissions` is the only place the installation's actual grant is
+  // readable. Discarding it left doctor unable to tell "pull_requests: write"
+  // from "pull_requests: read" — a difference that otherwise surfaces as a 4xx
+  // at review-post time, after the whole review has already been paid for.
+  // Passed through as GitHub sent it, undefined included: fabricating {} here
+  // would read downstream as a real answer of "grants nothing", and an
+  // unverifiable grant must not be able to masquerade as a verified one.
+  return { token: body.token, expiresAt: body.expires_at, permissions: body.permissions }
 }
 
 export async function getBotLogin({ appId, privateKeyPem, nowSeconds, fetchImpl = fetch }) {

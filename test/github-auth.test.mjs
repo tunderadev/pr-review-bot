@@ -26,15 +26,37 @@ test('mintAppJwt produces a verifiable RS256 JWT with GitHub-required claims', (
 
 test('getInstallationToken exchanges the JWT for an installation token', async () => {
   const calls = []
+  const permissions = { pull_requests: 'write', issues: 'write', contents: 'read' }
   const fetchImpl = async (url, init) => {
     calls.push({ url, init })
-    return { ok: true, status: 201, json: async () => ({ token: 'ghs_abc', expires_at: '2026-07-29T19:00:00Z' }) }
+    return { ok: true, status: 201, json: async () => ({ token: 'ghs_abc', expires_at: '2026-07-29T19:00:00Z', permissions }) }
   }
   const out = await getInstallationToken({ appId: 1, privateKeyPem: privateKey, installationId: 99, nowSeconds: NOW, fetchImpl })
-  assert.deepEqual(out, { token: 'ghs_abc', expiresAt: '2026-07-29T19:00:00Z' })
+  assert.deepEqual(out, { token: 'ghs_abc', expiresAt: '2026-07-29T19:00:00Z', permissions })
   assert.equal(calls[0].url, 'https://api.github.com/app/installations/99/access_tokens')
   assert.equal(calls[0].init.method, 'POST')
   assert.match(calls[0].init.headers.authorization, /^Bearer eyJ/)
+})
+
+test('getInstallationToken returns the granted permissions, which doctor reads to predict a 422', async () => {
+  // The under-privileged case is the one worth pinning: a read-only grant is
+  // indistinguishable from a write grant until the review POST is rejected,
+  // which is after a full model review has been bought.
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 201,
+    json: async () => ({ token: 'ghs_abc', expires_at: '2026-07-29T19:00:00Z', permissions: { pull_requests: 'read', contents: 'read' } }),
+  })
+  const out = await getInstallationToken({ appId: 1, privateKeyPem: privateKey, installationId: 99, nowSeconds: NOW, fetchImpl })
+  assert.deepEqual(out.permissions, { pull_requests: 'read', contents: 'read' })
+})
+
+test('getInstallationToken does not invent permissions a response never carried', async () => {
+  // An empty object would read downstream as a real answer of "grants
+  // nothing"; undefined is what makes doctor say the grant is unverified.
+  const fetchImpl = async () => ({ ok: true, status: 201, json: async () => ({ token: 'ghs_abc', expires_at: '2026-07-29T19:00:00Z' }) })
+  const out = await getInstallationToken({ appId: 1, privateKeyPem: privateKey, installationId: 99, nowSeconds: NOW, fetchImpl })
+  assert.equal(out.permissions, undefined)
 })
 
 test('getInstallationToken surfaces a readable error on failure', async () => {

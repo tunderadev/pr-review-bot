@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { runCycle } from '../src/cycle.mjs'
+import { runCycle, REVIEW_FALLBACK_NOTE } from '../src/cycle.mjs'
 import { renderStateComment, emptyState, appendRound, parseState } from '../src/state.mjs'
-import { TransientError } from '../src/github.mjs'
+import { TransientError, FatalError } from '../src/github.mjs'
 import { ReviewTimeoutError } from '../src/review.mjs'
 
 const BOT = 'plat-reviewer[bot]'
@@ -467,6 +467,74 @@ test('the worktree is cleaned up even when the review throws', async () => {
   const { deps, actions } = makeDeps({ runReview: async () => { throw new Error('verdict unparseable') } })
   await runCycle({ config, deps, now: NOW })
   assert.ok(named(actions, 'cleanup').length === 1)
+})
+
+// GitHub answers 422 "Can not approve your own pull request" to a personal
+// token, so a misconfigured installation hits this on its first approval.
+const REJECT_422 = 'GitHub POST /repos/o/r/pulls/7/reviews failed (422): Can not approve your own pull request'
+const fallbacks = (actions) => actions.filter((a) => a[0] === 'comment' && a[1].includes(REVIEW_FALLBACK_NOTE))
+
+test('a rejected review is preserved as a plain comment, then benched', async () => {
+  let sent = null
+  const { deps, actions } = makeDeps({
+    github: { createReview: async (r, n, x) => { sent = x.body; throw new FatalError(REJECT_422) } },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+
+  assert.equal(out.processed[0].outcome, 'error')
+  assert.equal(out.aborted, false, '422 is deterministic — the rest of the cycle is fine')
+  assert.ok(named(actions, 'add-label', 'review-error').length === 1, 'sticky, as with any per-PR failure')
+  assert.equal(named(actions, 'add-label', 'review-requested').length, 0, 'retrying a 422 cannot succeed')
+  const preserved = fallbacks(actions)
+  assert.equal(preserved.length, 1, 'the most expensive artifact this pipeline makes must not be dropped')
+  // Content, not merely presence: a stub posting an empty string would sail
+  // through "some comment was posted".
+  assert.ok(sent && preserved[0][1].includes(sent), 'the same rendered body that the review POST carried')
+  assert.match(preserved[0][1], /## ✅ Approved — Round 1/)
+})
+
+test('when preserving the review also fails, neither failure is lost', async () => {
+  const { deps, actions, logs } = makeDeps({
+    github: {
+      createReview: async () => { throw new FatalError(REJECT_422) },
+      createIssueComment: async () => { throw new FatalError('GitHub POST /repos/o/r/issues/7/comments failed (403): Resource not accessible by integration') },
+    },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+
+  assert.equal(out.processed[0].outcome, 'error')
+  assert.ok(named(actions, 'add-label', 'review-error').length === 1, 'the label lands even when both writes fail')
+  const reported = logs.find((m) => m.includes('Can not approve your own pull request'))
+  assert.ok(reported, `nothing reported the rejected review: ${JSON.stringify(logs)}`)
+  // The fallback's own failure must not stand in for the rejection that caused
+  // it — that cause is the one useful fact for whoever clears the sticky label.
+  assert.match(reported, /403/)
+  assert.match(reported, /422/)
+})
+
+test('a transient review rejection is retried next cycle, never preserved', async () => {
+  const { deps, actions } = makeDeps({
+    github: { createReview: async () => { throw new TransientError('GitHub POST /repos/o/r/pulls/7/reviews failed (502): bad gateway') } },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+
+  assert.equal(out.aborted, true)
+  assert.ok(named(actions, 'add-label', 'review-requested').length === 1)
+  assert.equal(named(actions, 'add-label', 'review-error').length, 0)
+  // The retry will post the review properly; a fallback comment now would
+  // leave the findings on the PR twice.
+  assert.equal(fallbacks(actions).length, 0)
+})
+
+test('a successful review posts no fallback comment', async () => {
+  const { deps, actions } = makeDeps()
+  await runCycle({ config, deps, now: NOW })
+
+  assert.ok(named(actions, 'review', 'APPROVE').length === 1)
+  assert.equal(fallbacks(actions).length, 0, 'every clean review would otherwise double-post')
+  const comments = named(actions, 'comment')
+  assert.equal(comments.length, 1, 'round 1 writes exactly one comment')
+  assert.ok(parseState(comments[0][1]), 'and it is the ledger, not a copy of the review')
 })
 
 test('maxPerCycle is a whole-cycle budget, spent oldest-first across every repo', async () => {

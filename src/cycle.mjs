@@ -155,6 +155,48 @@ const writeState = async ({ github, pr, sticky, state }) => {
   return sticky ? github.updateIssueComment(pr.repo, sticky.id, body) : github.createIssueComment(pr.repo, pr.number, body)
 }
 
+// Prefixed to a preserved review so nobody reads a body headed "✅ Approved" as
+// an approval that actually landed. Fixed prose, deliberately: this string is
+// published, and render.mjs's rule is that no raw internal error text, path or
+// environment value may reach a public comment. The cause goes to the log.
+export const REVIEW_FALLBACK_NOTE =
+  '> ⚠️ **GitHub rejected this review, so it is reproduced here as a plain comment.** ' +
+  'No formal review state was recorded on this PR and the bot has stopped working on it — a human needs to look.'
+
+// By the time this POST happens the review is the most expensive artifact the
+// pipeline produces: a full model review plus up to two refutation calls per
+// blocking finding, minutes of wall clock, all drawn from the operator's own
+// subscription quota. Losing it to a rejected POST means paying for it again
+// next round while the author sees nothing at all, so the body is preserved as
+// an ordinary comment — strictly better than silence, since the findings stay
+// readable and actionable even though the review state never landed.
+//
+// The likeliest trigger is the very thing that forced the GitHub App design:
+// GitHub answers 422 "Can not approve your own pull request" to a personal
+// token, so a misconfigured installation hits this on its first approval.
+async function postReviewOrPreserve({ github, pr, event, body, ref }) {
+  try {
+    return await github.createReview(pr.repo, pr.number, { event, body })
+  } catch (error) {
+    // A transient rejection (502, secondary rate limit) is retried next cycle
+    // and would then post the findings a second time, so only a deterministic
+    // rejection earns the fallback. 422 is deterministic: never retried, since
+    // retrying costs time and cannot succeed.
+    if (isTransientFailure(error)) throw error
+    let preserved
+    try {
+      await github.createIssueComment(pr.repo, pr.number, `${REVIEW_FALLBACK_NOTE}\n\n${body}`)
+      preserved = 'the review body was preserved as a plain comment'
+    } catch (fallbackError) {
+      // Letting this one propagate on its own would report only that the
+      // comment failed and lose the rejection that caused it — the single most
+      // useful fact for whoever has to clear the sticky label.
+      preserved = `preserving it as a plain comment ALSO failed: ${fallbackError.message}`
+    }
+    throw new FatalError(`GitHub rejected the review on ${ref}: ${error.message} — ${preserved}`, { cause: error })
+  }
+}
+
 export async function runCycle({ config, deps, dryRun = false, now = new Date().toISOString() }) {
   const { github, slack, checkouts, runReview, refuteBlockers, telemetry, botLogin, log } = deps
   const slackOps = makeSlackOps({ slack, config, log })
@@ -276,7 +318,7 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
         skippedFiles,
         criteriaVersion,
       })
-      const posted = await github.createReview(pr.repo, pr.number, { event: verdictToEvent(survivors), body })
+      const posted = await postReviewOrPreserve({ github, pr, event: verdictToEvent(survivors), body, ref })
       const name = verdictName(survivors)
 
       binding = await slackOps.reconcile(binding, name, ref)
@@ -318,6 +360,13 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       // A ts minted this cycle is only durable once it reaches the sticky
       // comment. Without this, any failure after the announcement re-announces
       // next cycle, orphaning the reaction on the first message.
+      //
+      // Only the binding — deliberately NOT a round. state.mjs has a
+      // VERDICT_LABEL.error entry that invites appending an "errored" round
+      // here, and doing so is a trap: previousBlockers is read from
+      // lastRound(state).blockers, so an error round (blockers: []) would make
+      // the NEXT review forget every outstanding blocker from the last real
+      // round, and silently re-approve what it already asked to be fixed.
       if (bindingChanged(binding, state.slack)) {
         await writeState({ github, pr, sticky, state: { ...state, slack: binding } })
           .catch((e) => log(`Could not persist the Slack binding for ${ref}: ${e.message}`))

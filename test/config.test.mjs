@@ -209,6 +209,70 @@ test('every synthetic provider key is caught, not two thirds of them', () => {
   assert.equal(checked, 800)
 })
 
+// The prefixes a user of THIS tool actually has on hand. xapp- is first
+// deliberately: the tool is a Slack integration, and xox[baprs]- excludes the
+// app-level token, so the one credential most likely to be pasted into
+// team.json was the one credential nothing looked for.
+const PROVIDER_LEAKS = [
+  ['Slack app-level', 'xapp-1-A05J8QK3LMN-6035112233445-9f2c1d8e7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f'],
+  ['AWS access key id', 'AKIAIOSFODNN7EXAMPLE'],
+  ['Google API key', 'AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY'],
+  ['Groq', 'gsk_1a2B3c4D5e6F7g8H9i0JklMnOpQrStUvWxYz1234567890abcd'],
+  ['xAI', 'xai-9fK2mQ4vX7bN1zR8cT5jH0pL3wS6yF2gD9kM7nB4xV1aZ'],
+  ['HuggingFace', 'hf_' + 'KjHgFdSaPoIuYtReWqZxCvBnMlKjHgFdSa'],
+]
+
+test('every provider prefix a user of this tool might paste is a credential', () => {
+  for (const [vendor, value] of PROVIDER_LEAKS) {
+    assert.throws(() => assertNoSecrets({ ...VALID, note: value }), /"note"/, `missed a ${vendor} token`)
+    assert.throws(
+      () => assertNoSecrets({ ...VALID, note: `SLACK_APP_TOKEN=${value}` }),
+      /"note"/,
+      `missed a ${vendor} token mid-string`
+    )
+  }
+})
+
+test('an all-caps value is exempt only while it is a NAME, never when it is a credential', () => {
+  // "It looks like an env var name" used to exempt the value outright, under
+  // any key at all — which is the exact shape of an AWS access key id and of
+  // any SCREAMING_SNAKE credential. Being all-caps is not evidence of
+  // innocence; not matching a credential shape is.
+  assert.throws(() => assertNoSecrets({ ...VALID, apiKey: 'AKIAIOSFODNN7EXAMPLE' }), /apiKey/, 'missed an AWS access key id under apiKey')
+  // No vendor prefix at all: nothing but the key and the shape of the value
+  // marks this one, so it pins the exemption itself rather than a pattern.
+  assert.throws(() => assertNoSecrets({ ...VALID, apiKey: 'A1B2C3D4E5F6G7H8I9J0K1L2' }), /apiKey/, 'missed an unprefixed SCREAMING_SNAKE credential under apiKey')
+  // A key that still only names where the secret lives stays legal.
+  for (const name of ['ANTHROPIC_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'GOOGLE_APPLICATION_CREDENTIALS']) {
+    assert.doesNotThrow(() => assertNoSecrets({ ...VALID, apiKeyEnvVar: name }), `rejected env var name ${name}`)
+  }
+})
+
+test('a path, a repo name and a model id are not credentials', () => {
+  // Every one of these hard-fails startup with a message accusing the team of
+  // committing a credential. secretsManagerPath is the canonical GCP Secret
+  // Manager path, on a key whose entire purpose is to NAME where a secret
+  // lives; the model ids are ordinary capitalised model ids; the last two are
+  // an ops path and a repo name that merely reach 32 kebab-case characters.
+  const ordinary = [
+    ['secretsManagerPath', 'projects/123456/secrets/PR_BOT_TOKEN'],
+    ['tokenizerModel', 'Claude-Sonnet-4-5-20250929'],
+    ['tokenizerModel', 'GPT-4o-2024-08-06'],
+    ['clonesDir', '/opt/sk-review-bot-clones-CI-2026-shard1'],
+    ['repos', ['acme/sk-learn-Model-2024-experiments-archive']],
+  ]
+  for (const [key, value] of ordinary) {
+    assert.doesNotThrow(
+      () => assertNoSecrets({ ...VALID, [key]: value }),
+      `rejected ordinary config ${key}=${JSON.stringify(value)}`
+    )
+  }
+  // Narrowing these must not disarm the same keys against real material.
+  assert.throws(() => assertNoSecrets({ ...VALID, secretsManagerPath: '8f14e45fceea167a5a36dedd4bea25436a1f7e2c' }), /secretsManagerPath/)
+  assert.throws(() => assertNoSecrets({ ...VALID, clonesDir: '/opt/clones/xoxb-1-2-abcdefghijklmnop' }), /clonesDir/)
+  assert.throws(() => assertNoSecrets({ ...VALID, repos: ['acme/sk-proj-9dK_2mQ-4vX_7bN-1zR_8cT-5jH_0pL-3wS'] }), /repos\.0/)
+})
+
 test('assertNoSecrets covers separator and camelCase spellings of secret keys', () => {
   // The value is a 40-char hex blob: no vendor prefix, so nothing but the KEY
   // marks it as a credential. That is the case key-based detection exists for.

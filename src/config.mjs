@@ -25,6 +25,11 @@ const SECRET_VALUE_RE = new RegExp(
     // Slack: xoxb-<workspace>-<id>-<secret>. No non-credential string contains
     // "xox", so the body only has to be more than a mention of the prefix.
     'xox[baprs]-[A-Za-z0-9-]{10,}',
+    // Slack app-level tokens (Socket Mode) are xapp-, which xox[baprs]-
+    // deliberately excludes — and this tool IS a Slack integration, so it is
+    // the single credential its users are most likely to have on hand while
+    // editing team.json. Nothing else looked for it.
+    'xapp-[A-Za-z0-9-]{10,}',
     // GitHub: ghp_/gho_/ghs_/ghu_/ghr_ plus 36 alphanumerics; fine-grained PATs
     // are github_pat_ plus a much longer alphanumeric/underscore body. These
     // bodies really are alphanumeric — GitHub's alphabet has no "-" or "_" —
@@ -40,11 +45,27 @@ const SECRET_VALUE_RE = new RegExp(
     'sk-proj-[A-Za-z0-9_-]{20,}',
     // Classic sk- keys, and anything else that reaches a 20-run.
     'sk-(?:[A-Za-z0-9_]+-)*[A-Za-z0-9_]{20,}',
-    // Backstop for prefixes no one has published yet: a long base64url body
-    // carrying both capitals and digits is random key material. Kebab-case
-    // paths and repo names are neither long enough nor mixed — "sk-clones" and
-    // "sk-cache-of-review-clones" stop at 22 characters, all lowercase.
-    'sk-(?=[A-Za-z0-9_-]{32,})(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\\d)[A-Za-z0-9_-]{32,}',
+    // Google (Maps, Gemini, and every other Google API): AIza + 35 base64url.
+    'AIza[A-Za-z0-9_-]{30,}',
+    // Groq, xAI, HuggingFace — all long unbroken alphanumeric bodies.
+    'gsk_[A-Za-z0-9]{20,}',
+    'xai-[A-Za-z0-9]{20,}',
+    'hf_' + '[A-Za-z0-9]{20,}',
+    // AWS key ids are SCREAMING_SNAKE-shaped, which is exactly what the
+    // env-var-name exemption below used to wave through: AKIAIOSFODNN7EXAMPLE
+    // reads as a variable name and is a live credential.
+    'A(?:KIA|SIA|ROA|IDA|NPA|GPA|IPA|PKA)[0-9A-Z]{16}',
+    // Backstop for prefixes no one has published yet. What marks random key
+    // material is a case transition INSIDE one unbroken run — "x7Kd", "9fPq2",
+    // "Lm4Nb" — which is something kebab-case names never do, because their
+    // word boundaries are the separators. The old test was "a capital and a
+    // digit anywhere in 32 characters", and ordinary values met it: an ops
+    // path (/opt/sk-review-bot-clones-CI-2026-shard1) and a repo name
+    // (acme/sk-learn-Model-2024-experiments-archive) each hard-failed startup
+    // with a message accusing the team of committing a credential. Capitalised
+    // words ("Model") and acronyms ("CI") carry no in-run transition; a
+    // base64url body of this length carries one with near-certainty.
+    'sk-(?=[A-Za-z0-9_-]{32,})(?=[A-Za-z0-9_-]*\\d)(?=[A-Za-z0-9_-]*[a-z][A-Za-z0-9]*[A-Z])[A-Za-z0-9_-]{32,}',
     '-----BEGIN',
   ].join('|')
 )
@@ -56,23 +77,39 @@ const SECRET_VALUE_RE = new RegExp(
 // hard-failed startup with a message accusing the team of committing a
 // credential, and so did apiKeyEnvVar / credentialHelper / secretsManagerPath,
 // which name where a secret lives rather than holding one.
-const OPAQUE_VALUE_RE = /^[A-Za-z0-9+/=_.~-]{16,}$/
-// A leading "/", "~" or "." is a location, not key material.
+// A leading "/", "~" or "." is a location, not key material. Kept as an
+// exemption rather than folded into the run test below because machine-made
+// paths really do carry long random segments (/var/folders/T/AbCd19…/clones).
 const PATH_LIKE_RE = /^[~.]|^\/|^[A-Za-z]:\\/
-// ANTHROPIC_API_KEY names a variable; the secret is whatever it holds.
-const ENV_VAR_NAME_RE = /^[A-Z][A-Z0-9_]*$/
+// Where a human name puts its word boundaries. Random material does not have
+// word boundaries, so the RUNS between separators are what get measured.
+const RUN_RE = /[A-Za-z0-9]+/g
 
 function looksLikeSecretMaterial(value) {
   // A budget is a number, and no number is a credential.
   if (typeof value !== 'string') return false
   const v = value.trim()
-  // Anything with a space is prose; anything under 16 characters is a word
-  // like "osxkeychain" or "cl100k", not key material.
-  if (!OPAQUE_VALUE_RE.test(v) || PATH_LIKE_RE.test(v) || ENV_VAR_NAME_RE.test(v)) return false
-  // Random material carries capitals and digits together, or runs unbroken for
-  // 32 characters. A model id like "claude-sonnet-4-5-20250929" does neither,
-  // and that is exactly what a key named "tokenizerModel" actually holds.
-  return (/[A-Z]/.test(v) && /\d/.test(v)) || /^[A-Za-z0-9]{32,}$/.test(v)
+  // A recognised credential shape is a credential whatever else it resembles.
+  // This is the whole of the old env-var-name exemption's undoing: "it looks
+  // like ANTHROPIC_API_KEY" exempted the VALUE under every key including
+  // apiKey, and an AWS access key id is shaped precisely like a variable name.
+  // Being all-caps is not evidence of innocence; matching no known credential
+  // shape is, and that is now the only version of the exemption left.
+  if (SECRET_VALUE_RE.test(v)) return true
+  if (PATH_LIKE_RE.test(v)) return false
+  // Randomness shows up as an unbroken RUN, not as a capital and a digit
+  // sitting somewhere in the same string. Counting across separators read
+  // "Claude-Sonnet-4-5-20250929" (an ordinary capitalised model id) and
+  // "projects/123456/secrets/PR_BOT_TOKEN" (the canonical GCP Secret Manager
+  // path, on a key whose entire purpose is to name where a secret lives) as
+  // key material and hard-failed startup accusing the team of committing a
+  // credential. 32 unbroken characters is a blob — a hex digest, a bare base64
+  // string, the case key-based detection exists for; 16 carrying both a
+  // capital and a digit is random rather than a word. "ANTHROPIC_API_KEY",
+  // "osxkeychain" and "cl100k" are neither.
+  return (v.match(RUN_RE) || []).some(
+    (run) => run.length >= 32 || (run.length >= 16 && /[A-Z]/.test(run) && /\d/.test(run))
+  )
 }
 
 function isSecretShapedKey(key) {

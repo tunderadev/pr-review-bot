@@ -18,16 +18,27 @@ export function buildRefutationPrompt({ finding, pr }) {
   ].join('\n')
 }
 
-export function parseRefutation(text) {
+// The same parse, plus the one bit parseRefutation deliberately collapses:
+// whether the model honoured the contract at all. refuteBlockers needs it to
+// tell "the model answered and the claim did not survive" from "we never got an
+// answer"; every other caller only wants the safe reading.
+function readVerdict(text) {
   try {
     const first = text.indexOf('{')
     const last = text.lastIndexOf('}')
     const parsed = JSON.parse(text.slice(first, last + 1))
-    if (typeof parsed.refuted !== 'boolean') return { refuted: true, why: 'refutation verdict unreadable' }
-    return { refuted: parsed.refuted, why: parsed.why || '' }
+    if (typeof parsed.refuted !== 'boolean') return { readable: false }
+    return { readable: true, refuted: parsed.refuted, why: parsed.why || '' }
   } catch {
-    return { refuted: true, why: 'refutation verdict unreadable' }
+    return { readable: false }
   }
+}
+
+export function parseRefutation(text) {
+  const verdict = readVerdict(text)
+  return verdict.readable
+    ? { refuted: verdict.refuted, why: verdict.why }
+    : { refuted: true, why: 'refutation verdict unreadable' }
 }
 
 export async function refuteBlockers({ findings, pr, cwd, spawnImpl, timeoutMs }) {
@@ -42,19 +53,39 @@ export async function refuteBlockers({ findings, pr, cwd, spawnImpl, timeoutMs }
   // its run (isError / timedOut), and a caller that shows an approval built on
   // unverified findings needs to be able to see that.
   const runs = []
+  // Reads one attempt. Returns null when the model answered but broke the
+  // contract — the only outcome worth asking again about.
+  const decide = (run) => {
+    // A run the CLI reports as failed is not a verdict in either direction. It
+    // cannot clear the claim — and it cannot confirm one either: putting a
+    // finding in front of the author on the strength of a failed run blocks them
+    // over something nothing actually checked. A quota wall lands here, says
+    // nothing whatever about the finding's merit, and is not beaten by asking
+    // again a second later.
+    if (run.isError) return { refuted: true, why: 'not verified: the refutation could not be completed', unverified: true }
+    const verdict = readVerdict(run.result)
+    return verdict.readable ? { refuted: verdict.refuted, why: verdict.why, unverified: false } : null
+  }
   for (const finding of blockers) {
+    const prompt = buildRefutationPrompt({ finding, pr })
     let verdict
     try {
-      const run = await runClaude({ prompt: buildRefutationPrompt({ finding, pr }), cwd, spawnImpl, timeoutMs })
+      const run = await runClaude({ prompt, cwd, spawnImpl, timeoutMs })
       runs.push(run)
-      // A run the CLI reports as failed is not a verdict in either direction. It
-      // cannot clear the claim — and it cannot confirm one either: putting a
-      // finding in front of the author on the strength of a failed run blocks
-      // them over something nothing actually checked. A quota wall lands here,
-      // and it says nothing whatever about the finding's merit.
-      verdict = run.isError
-        ? { refuted: true, why: 'not verified: the refutation could not be completed', unverified: true }
-        : { ...parseRefutation(run.result), unverified: false }
+      verdict = decide(run)
+      if (!verdict) {
+        // One unparseable response is plausibly a formatting slip, so it earns a
+        // second ask with the contract restated — the same courtesy runReview
+        // extends to the review itself.
+        const retry = await runClaude({ prompt: `${prompt}\n\nYour previous response was not valid JSON. Respond with ONLY the JSON object described above: {"refuted": true|false, "why": "one sentence"}`, cwd, spawnImpl, timeoutMs })
+        runs.push(retry)
+        // Twice through a strict, restated contract is not a considered judgment
+        // about the finding; it is the contract not being honoured, which means
+        // no answer was obtained. Reading it as a refutation on the merits is
+        // precisely how a regressed or misconfigured model would quietly approve
+        // a PR full of real blocking defects.
+        verdict = decide(retry) ?? { refuted: true, why: 'not verified: the refutation did not answer in the required format', unverified: true }
+      }
     } catch (e) {
       // A timeout is the same kind of event as an unreadable answer: nobody
       // produced a verdict, so the refute-by-default bias applies and the finding

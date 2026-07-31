@@ -97,11 +97,12 @@ test('each refutation runs against the checked-out PR head and names its own cla
 test('a confident-sounding but unreadable refutation still drops the finding', async () => {
   // The dangerous inversion is defaulting to NOT refuted: it lets garbage — or
   // a model that only ever writes prose — block a colleague's PR.
-  const impl = fakeSpawn(['Yes, this is definitely a real bug and it must be fixed before merge.'])
+  const prose = 'Yes, this is definitely a real bug and it must be fixed before merge.'
+  const impl = fakeSpawn([prose, prose])
   const out = await refuteBlockers({ findings: [blocking('real')], pr: PR, cwd: '/wt', spawnImpl: impl })
   assert.deepEqual(out.survivors, [], 'no verdict is not a surviving verdict')
   assert.deepEqual(out.refuted.map((f) => f.claim), ['real'])
-  assert.equal(out.runs.length, 1)
+  assert.equal(out.runs.length, 2, 'one unreadable answer earns a retry before the finding is dropped')
 })
 
 test('every blocker lands in exactly one list, keeping its fields and its reason', async () => {
@@ -203,17 +204,86 @@ test('a pass where every refutation errored out is degraded', async () => {
   assert.deepEqual(out.runs.map((r) => r.isError), [true, true])
 })
 
-test('a pass where the model answered every time but unreadably is NOT degraded', async () => {
-  // The discriminating case. The model ran, read the code, and failed to
-  // substantiate the claims — that is real uncertainty, and the refute-by-default
-  // bias is exactly right for it. Flagging this as degraded would make `degraded`
-  // a synonym for `refuted.length > 0` and strip it of meaning.
-  const impl = fakeSpawn(['I could not find a path to that failure, honestly.', 'Seems fine? Hard to say.'])
+test('a model that never honours the response contract is degraded, not merely uncertain', async () => {
+  // Two failures of a strict, restated contract is not a considered judgment
+  // about the finding — it is the contract not being honoured, which means no
+  // answer was obtained. Filing it as a refutation on the merits is what lets a
+  // regressed or misconfigured model quietly approve a PR full of real defects.
+  const impl = fakeSpawn(['I could not find a path to that failure, honestly.', 'Seems fine? Hard to say.', 'Nope.', 'Still nope.'])
   const out = await refuteBlockers({ findings: [blocking('a'), blocking('b')], pr: PR, cwd: '/wt', spawnImpl: impl })
   assert.deepEqual(out.survivors, [])
   assert.deepEqual(out.refuted.map((f) => f.claim), ['a', 'b'])
-  assert.equal(out.degraded, false, 'a model that answered is not an infrastructure failure')
-  assert.deepEqual(out.refuted.map((f) => f.unverified), [false, false])
+  assert.equal(out.degraded, true)
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [true, true])
+  assert.equal(impl.calls.length, 4, 'two attempts per finding, no more')
+})
+
+test('one unreadable answer then a real verdict is a refutation on the merits', async () => {
+  // The discriminating case for `degraded`. A single unparseable response is
+  // plausibly a formatting slip; the model got a second chance and used it, so
+  // this is a genuine verdict and the pass is not degraded.
+  const impl = fakeSpawn(['Hmm, let me think about that.', '{"refuted":true,"why":"guarded upstream"}'])
+  const out = await refuteBlockers({ findings: [blocking('bogus')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.deepEqual(out.survivors, [])
+  assert.deepEqual(out.refuted.map((f) => f.claim), ['bogus'])
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [false], 'the model answered on the second ask')
+  assert.equal(out.degraded, false, 'a slip that the retry fixed is not a degraded pass')
+  assert.equal(out.refuted[0].refutation, 'guarded upstream')
+  assert.equal(out.runs.length, 2, 'both attempts are reported: the retry cost real quota')
+})
+
+test('the retry restates the contract, and there is exactly one of them', async () => {
+  const impl = fakeSpawn(['prose one', 'prose two', 'prose three', 'prose four'])
+  await refuteBlockers({ findings: [blocking('real')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(impl.calls.length, 2, 'one retry, not a loop')
+  const [first, retry] = impl.calls.map((c) => c.prompt)
+  assert.notEqual(retry, first, 'resending the identical prompt is not a retry')
+  assert.ok(retry.startsWith(first), 'the retry keeps the original question')
+  const added = retry.slice(first.length)
+  assert.match(added, /not valid JSON/i, 'the retry names the failure')
+  assert.match(added, /"refuted"/, 'and restates the contract it wants honoured')
+})
+
+test('a parseable first answer is never asked twice', async () => {
+  // The retry is only for a broken contract. Paying for a second child on every
+  // finding would double the cost of the whole pass.
+  const impl = fakeSpawn(['{"refuted":true,"why":"guarded"}', '{"refuted":false,"why":"unused"}'])
+  const out = await refuteBlockers({ findings: [blocking('bogus')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(impl.calls.length, 1, 'a good answer is not second-guessed')
+  assert.equal(out.runs.length, 1)
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [false])
+  assert.equal(out.degraded, false)
+})
+
+test('an errored first attempt is not retried, and is degraded either way', async () => {
+  // A quota wall is not beaten by asking again a second later; the retry exists
+  // for a formatting slip, not for infrastructure.
+  const impl = fakeSpawn([errorRun('Claude AI usage limit reached'), '{"refuted":false,"why":"unused"}'])
+  const out = await refuteBlockers({ findings: [blocking('real')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(impl.calls.length, 1, 'no second call into a wall')
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [true])
+  assert.equal(out.degraded, true)
+})
+
+test('a timeout on either attempt lands as unverified, never as a refutation on the merits', async () => {
+  // First attempt hangs: no retry, because the budget is per finding and a
+  // wedged child has already spent it.
+  const early = fakeSpawn([null, '{"refuted":true,"why":"unused"}'])
+  const outEarly = await refuteBlockers({ findings: [blocking('a')], pr: PR, cwd: '/wt', spawnImpl: early, timeoutMs: 25 })
+  assert.equal(early.calls.length, 1, 'a timed-out finding is not re-asked')
+  assert.deepEqual(outEarly.refuted.map((f) => f.unverified), [true])
+  assert.equal(outEarly.degraded, true)
+
+  // Unreadable first, then the retry hangs: still unverified, never merits.
+  const late = fakeSpawn(['prose, sorry', null])
+  const outLate = await refuteBlockers({ findings: [blocking('b')], pr: PR, cwd: '/wt', spawnImpl: late, timeoutMs: 25 })
+  assert.equal(late.calls.length, 2)
+  assert.deepEqual(outLate.survivors, [])
+  assert.deepEqual(outLate.refuted.map((f) => f.unverified), [true])
+  assert.equal(outLate.degraded, true)
+  assert.match(outLate.refuted[0].refutation, /timed out/i)
+  assert.equal(outLate.runs.length, 2, 'both the wasted answer and the wedged retry are reported')
+  assert.deepEqual(late.killed, ['SIGKILL'])
 })
 
 test('one genuine refutation plus one timeout is degraded', async () => {

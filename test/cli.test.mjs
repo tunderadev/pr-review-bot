@@ -131,11 +131,43 @@ const stdout = (out) => out.filter((l) => l.stream === 'out').map((l) => l.text)
 // ---------------------------------------------------------------------------
 
 test('parseArgs defaults to cycle with no dry run and no reset', () => {
-  assert.deepEqual(parseArgs([]), { command: 'cycle', configFlag: undefined, dryRun: false, json: false, reset: false })
+  assert.deepEqual(parseArgs([]), { command: 'cycle', configFlag: undefined, dryRun: false, json: false, reset: false, limit: undefined })
+})
+
+test('parseArgs reads --limit as a number, in both spellings', () => {
+  assert.equal(parseArgs(['cycle', '--limit', '1']).limit, 1)
+  assert.equal(parseArgs(['cycle', '--limit=2']).limit, 2)
+  assert.equal(parseArgs(['cycle', '--dry-run', '--limit', '1']).limit, 1)
+  assert.equal(parseArgs([]).limit, undefined, 'absent means "whatever maxPerCycle says"')
+})
+
+test('parseArgs rejects a --limit that is not a positive integer', () => {
+  // 0 is the dangerous one: it is a number, it parses, and it would run a
+  // cycle that reviews nothing while reporting success.
+  for (const bad of ['0', 'abc', '1.5', '1e3', '01x', 'one', '+1']) {
+    assert.throws(
+      () => parseArgs(['cycle', '--limit', bad]),
+      /--limit needs a positive integer/,
+      `accepted --limit "${bad}"`
+    )
+  }
+  // A negative is flag-shaped, so it reaches the missing-value branch rather
+  // than the validator. It must still be refused with the SAME sentence, and
+  // that sentence has to echo what was actually typed — otherwise the operator
+  // is told "--limit needs a positive integer" about an argument the parser
+  // never even saw, which reads as though they omitted it entirely.
+  assert.throws(() => parseArgs(['cycle', '--limit', '-1']), /--limit needs a positive integer, got "-1"/)
+  assert.throws(() => parseArgs(['cycle', '--limit']), /--limit needs a positive integer/)
+  assert.throws(() => parseArgs(['cycle', '--limit=']), /--limit needs a positive integer/)
+})
+
+test('parseArgs accepts --limit only on cycle', () => {
+  assert.throws(() => parseArgs(['doctor', '--limit', '1']), /--limit.*only.*cycle/s)
+  assert.throws(() => parseArgs(['report', '--limit', '1']), /--limit.*only.*cycle/s)
 })
 
 test('parseArgs reads command, --config, --dry-run, --json, --reset', () => {
-  assert.deepEqual(parseArgs(['doctor', '--config', '/c', '--json']), { command: 'doctor', configFlag: '/c', dryRun: false, json: true, reset: false })
+  assert.deepEqual(parseArgs(['doctor', '--config', '/c', '--json']), { command: 'doctor', configFlag: '/c', dryRun: false, json: true, reset: false, limit: undefined })
   assert.equal(parseArgs(['cycle', '--dry-run']).dryRun, true)
   assert.equal(parseArgs(['report', '--reset']).reset, true)
   assert.equal(parseArgs(['doctor', '--config=/c']).configFlag, '/c', '--config=value is the other spelling every CLI accepts')
@@ -533,6 +565,42 @@ test('cycle --dry-run reaches runCycle as dryRun', async () => {
   const { opts, calls } = harness()
   assert.equal(await main(['cycle', '--dry-run'], opts), EXIT.ok)
   assert.equal(calls.cycle[0].dryRun, true)
+})
+
+test('--limit overrides maxPerCycle for this invocation only', async () => {
+  // The tuning loop is edit -> dry-run -> read -> edit, and every iteration
+  // otherwise pays for maxPerCycle reviews out of the operator's personal
+  // subscription when they need to see one rule act on one PR.
+  const { opts, calls } = harness()
+  assert.equal(await main(['cycle', '--dry-run', '--limit', '1'], opts), EXIT.ok)
+  assert.equal(calls.cycle[0].config.maxPerCycle, 1)
+  assert.equal(CONFIG.maxPerCycle, 3, 'the loaded config object must not be mutated')
+  // Everything else about the config has to survive the override.
+  assert.equal(calls.cycle[0].config.criteria, CONFIG.criteria)
+  assert.equal(calls.cycle[0].config.clonesDir, CONFIG.clonesDir)
+})
+
+test('--limit applies to a live cycle too, not just a dry run', async () => {
+  // Babysitting exactly one real review is the same legitimate need.
+  const { opts, calls } = harness()
+  assert.equal(await main(['cycle', '--limit', '2'], opts), EXIT.ok)
+  assert.equal(calls.cycle[0].dryRun, false)
+  assert.equal(calls.cycle[0].config.maxPerCycle, 2)
+})
+
+test('omitting --limit leaves maxPerCycle exactly as configured', async () => {
+  const { opts, calls } = harness()
+  assert.equal(await main([], opts), EXIT.ok)
+  assert.equal(calls.cycle[0].config.maxPerCycle, 3)
+  assert.equal(calls.cycle[0].config, CONFIG, 'no --limit means the config is passed through untouched')
+})
+
+test('a malformed --limit is a usage error, not a stack trace', async () => {
+  const { opts, out } = harness()
+  const code = await main(['cycle', '--limit', '0'], opts)
+  assert.equal(code, EXIT.config)
+  assert.match(text(out), /--limit needs a positive integer/)
+  noStack(out)
 })
 
 test('a clean cycle exits 0 and summarises the outcomes', async () => {

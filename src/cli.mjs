@@ -41,17 +41,41 @@ export const EXIT = {
 // that is NOT one of these is a bug, and the two must not share an exit code.
 class CliError extends Error {}
 
-const USAGE = 'Usage: pr-review-bot [cycle|doctor|report] [--config <dir>] [--dry-run] [--json] [--reset]'
+const USAGE =
+  'Usage: pr-review-bot [cycle|doctor|report] [--config <dir>] [--dry-run] [--limit <n>] [--json] [--reset]'
 
 const COMMANDS = ['cycle', 'doctor', 'report']
+
+// A positive integer and nothing else. "0" is the dangerous spelling: it is a
+// number, it parses, and it would run a cycle that reviews nothing while
+// reporting success. Floats and exponents are refused rather than rounded,
+// because a silently reinterpreted count is how someone asks for one review and
+// is billed for three.
+function positiveInteger(raw, name) {
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw new CliError(`${name} needs a positive integer, got "${raw}".\n${USAGE}`)
+  }
+  return Number(raw)
+}
 
 // Which command accepts which flag, and where each lands in the parsed result.
 // A flag the command does not implement is refused rather than ignored: the
 // dangerous spelling is `report --reset --dry-run`, where --dry-run reads as
 // "show me what this would do" and being ignored deletes the log anyway.
 const OPTIONS = {
-  '--config': { key: 'configFlag', commands: ['cycle', 'doctor'], value: 'a directory' },
+  '--config': { key: 'configFlag', commands: ['cycle', 'doctor'], value: 'a directory', placeholder: '<dir>' },
   '--dry-run': { key: 'dryRun', commands: ['cycle'] },
+  // Overrides maxPerCycle for one invocation. The criteria tuning loop is
+  // edit -> dry-run -> read -> edit, and every iteration otherwise pays for
+  // maxPerCycle full reviews out of the operator's personal Claude
+  // subscription when they only need to see one rule act on one PR.
+  '--limit': {
+    key: 'limit',
+    commands: ['cycle'],
+    value: 'a positive integer',
+    placeholder: '<n>',
+    parse: positiveInteger,
+  },
   '--json': { key: 'json', commands: ['cycle', 'doctor', 'report'] },
   '--reset': { key: 'reset', commands: ['report'] },
 }
@@ -66,7 +90,7 @@ export function parseArgs(argv) {
   if (!COMMANDS.includes(command)) {
     throw new CliError(`Unknown command "${command}". Expected one of: ${COMMANDS.join(', ')}.\n${USAGE}`)
   }
-  const parsed = { command, configFlag: undefined, dryRun: false, json: false, reset: false }
+  const parsed = { command, configFlag: undefined, dryRun: false, json: false, reset: false, limit: undefined }
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (!arg.startsWith('-')) throw new CliError(`Unexpected argument "${arg}".\n${USAGE}`)
@@ -88,10 +112,14 @@ export function parseArgs(argv) {
     // `--config --dry-run` as both a config directory named "--dry-run" and a
     // dry run, so the bot runs for real against a directory that cannot exist.
     const value = eq === -1 ? args[++i] : arg.slice(eq + 1)
+    // A flag-shaped value is a missing value — but for an option that validates
+    // its argument, `--limit -1` has to fail the way every other bad --limit
+    // fails, not with a different sentence about the value being absent.
     if (!value || value.startsWith('-')) {
-      throw new CliError(`${name} needs ${spec.value}: ${name} <dir>.\n${USAGE}`)
+      if (spec.parse) spec.parse(String(value ?? ''), name)
+      throw new CliError(`${name} needs ${spec.value}: ${name} ${spec.placeholder}.\n${USAGE}`)
     }
-    parsed[spec.key] = value
+    parsed[spec.key] = spec.parse ? spec.parse(value, name) : value
   }
   return parsed
 }
@@ -274,7 +302,7 @@ export async function main(argv, options = {}) {
   const logError = (message) => writeErr(secrets.redact(message))
 
   try {
-    const { command, configFlag, dryRun, json, reset } = parseArgs(argv)
+    const { command, configFlag, dryRun, json, reset, limit } = parseArgs(argv)
 
     // report is purely local: it reads one JSONL file written by past cycles.
     // No GitHub App token, no Slack client, and no team.json — asking "what did
@@ -407,7 +435,9 @@ export async function main(argv, options = {}) {
     }
 
     const result = await cycle({
-      config,
+      // A per-invocation override of maxPerCycle, applied by copy so the loaded
+      // config is never mutated. Absent means the configured value stands.
+      config: limit === undefined ? config : { ...config, maxPerCycle: limit },
       dryRun,
       now: new Date(now()).toISOString(),
       deps: {

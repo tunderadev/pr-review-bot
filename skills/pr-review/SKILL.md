@@ -24,11 +24,14 @@ config — the `review-in-progress` claim is a read-modify-write with a small ra
 
 Three commands, and each flag is refused by the commands that do not implement it:
 
-| | `--config <dir>` | `--dry-run` | `--json` | `--reset` |
-|---|---|---|---|---|
-| `cycle` (default) | yes | yes | yes | — |
-| `doctor` | yes | — | yes | — |
-| `report` | — | — | yes | yes |
+| | `--config <dir>` | `--dry-run` | `--limit <n>` | `--json` | `--reset` |
+|---|---|---|---|---|---|
+| `cycle` (default) | yes | yes | yes | yes | — |
+| `doctor` | yes | — | — | yes | — |
+| `report` | — | — | — | yes | yes |
+
+`--limit <n>` overrides `maxPerCycle` for one invocation and applies to live cycles as well as dry
+runs. It must be a positive integer; `0`, negatives and non-numbers are refused.
 
 Config resolves in this order, and `doctor` prints which tier won: `--config` → `PR_REVIEW_CONFIG_DIR`
 → `./.claude/pr-review/` → `~/.config/pr-review-bot/default/`. The directory must hold both
@@ -93,10 +96,15 @@ The short version:
   nothing.
 - A finding is `file`, `line`, `claim`, `why`. A rule that cannot name a locatable consequence
   cannot produce a finding.
-- After an edit, `cycle --dry-run --config <dir>` proves the file loads and shows which PRs would
-  be picked up. It spends no model call and posts nothing — but it does still need the credentials,
-  because it lists PRs to build that queue. It cannot show what a rule *finds*; only a live cycle
-  does that.
+- The tuning loop is **edit criteria → `cycle --dry-run --limit 1 --config <dir>` against a labeled
+  PR → read the rendered review → adjust → repeat.** A dry run performs the whole review — fetch,
+  checkout, model call, refutation pass, rendering — and prints the review body it would have
+  posted instead of posting it. It mutates nothing: no review, labels, ledger comment, or Slack.
+- **A dry run costs real quota**, the same model calls a live review makes, on the same Claude
+  subscription. It says so before the first call. `--limit 1` is what keeps the loop from paying
+  for `maxPerCycle` PRs per iteration.
+- A dry run deliberately ignores the same-SHA guard, so a PR the bot already reviewed can still be
+  used for tuning; it prints a line saying a live cycle would have skipped it.
 - Every review body ends with `criteria sha256:…`, also stored in the ledger as `criteriaVersion`.
   Same hash across rounds means the code changed; a different hash means the criteria did.
 

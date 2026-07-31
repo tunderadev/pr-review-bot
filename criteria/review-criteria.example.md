@@ -177,24 +177,55 @@ this file is the entire interface.
 2. If the evidence lives outside the diff, say so in the rule. The reviewer has the whole tree
    checked out, but it will not go looking unless a rule tells it to.
 
-**After either edit, check that the file still loads and the queue is what you think it is:**
+**After either edit, read what the rule actually does — against a real PR, without publishing
+anything:**
 
 ```bash
-node ~/code/pr-review-bot/src/cli.mjs cycle --dry-run --config <your config dir>
+node ~/code/pr-review-bot/src/cli.mjs cycle --dry-run --limit 1 --config <your config dir>
 ```
 
-Be precise about what that proves. It proves `team.json` and this file parse and load, and it
-prints the PRs a real cycle would pick up:
+That is the whole loop: **edit this file → dry-run → read the rendered review → adjust → repeat.**
+A dry run performs the complete review — it fetches the PR and its files, checks out the head,
+runs the model against these criteria, runs the refutation pass over the blocking findings, and
+renders the review body — then prints that body instead of posting it:
 
 ```
-[dry-run] would review owner/repo#12 (abc1234) "[PLAT] Add order history"
+[dry-run] 1 PR(s) would be reviewed:
+  owner/repo#12 (abc1234) "[PLAT] Add order history"
+[dry-run] Reviewing them now for real: same prompts, same criteria, same model calls, so this spends the same Claude subscription quota a live review does. Nothing is posted, labelled, or mirrored to Slack — each review is printed below instead.
+
+[dry-run] owner/repo#12 — would post REQUEST_CHANGES:
+
+## 🔧 Changes requested — Round 1
+
+Adds an order history page.
+
+### Blocking (1)
+
+- **src/api/orders.ts:88** — listOrders() catches the query error and returns []
+  - a database outage shows every customer an empty order history
+
+---
+<sub>Automated review · criteria `sha256:9814ac3eaf08` · re-add the review-requested label after pushing fixes.</sub>
+
+owner/repo#12 dry_run (changes_requested)
 1 PR(s): 1 dry_run
 ```
 
-It spends no model call and posts nothing — though it does still need the GitHub and Slack
-credentials, because listing those PRs is a real API call. What it cannot do is show you what a new
-rule *finds*. Only a live cycle exercises criteria, so run one against a PR you own, in a repo where
-a wrong verdict costs nobody anything.
+Three things to know before you run it:
+
+- **It costs real quota.** A dry run makes the identical model calls a live review does, billed to
+  the same Claude subscription that funds your interactive work. The warning above is printed
+  before the first call, so you can stop it. `--limit 1` exists for this loop: without it a dry run
+  reviews up to `maxPerCycle` PRs (default 3) and you pay for all of them on every iteration.
+- **It mutates nothing.** No review, no labels, no ledger comment, no Slack message or reaction.
+  The PR keeps its `review-requested` label, so you can run it again immediately.
+- **It ignores the same-head-SHA skip on purpose.** A live cycle skips a PR it has already reviewed
+  at that commit; a dry run previews it anyway, because re-running against an already-reviewed PR
+  *is* this loop. It prints a line saying a live cycle would have skipped it. That is not a bug.
+
+It still needs the GitHub and Slack credentials — listing and fetching the PR are real API calls —
+so run `doctor` first if it will not start.
 
 **Telling a criteria change from a code change.** Every review body ends with the hash of the
 criteria that produced it:

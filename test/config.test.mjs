@@ -136,8 +136,8 @@ test('validateConfig reports type problems together, not one per run', () => {
 })
 
 test('assertNoSecrets rejects token-shaped values and secret-shaped keys', () => {
-  assert.throws(() => assertNoSecrets({ ...VALID, slackBotToken: 'xoxb-' + '1-2-abc' }), /slackBotToken/)
-  assert.throws(() => assertNoSecrets({ ...VALID, nested: { deep: 'ghp_aaaaaaaaaaaabbbbbbbbbbbbcccccccccccc' } }), /nested\.deep/)
+  assert.throws(() => assertNoSecrets({ ...VALID, slackBotToken: 'xoxb-' + '1-2-abcdefghijklmnop' }), /slackBotToken/)
+  assert.throws(() => assertNoSecrets({ ...VALID, nested: { deep: 'ghp_0123456789abcdefghijklmnopqrstuvwx' } }), /nested\.deep/)
   assert.doesNotThrow(() => assertNoSecrets(VALID))
 })
 
@@ -145,12 +145,11 @@ test('assertNoSecrets finds a credential anywhere in the value, not only at posi
   // team.json is committed to a repo the team owns: anything that slips this
   // guard becomes a credential in git history.
   const leaks = [
-    'Bearer ghs_0123456789abcdefghij',
-    '  ghp_0123456789abcdefghij',
-    'use ghp_0123456789abcdefghij to test',
-    'export SLACK=xoxb-1-2-abcdef',
+    'Bearer ghs_0123456789abcdefghijklmnopqrstuvwx',
+    '  ghp_0123456789abcdefghijklmnopqrstuvwx',
+    'use ghp_0123456789abcdefghijklmnopqrstuvwx to test',
+    'export SLACK=xoxb-1-2-abcdefghijklmnop',
     'run with sk-abcdef0123456789abcdef0123456789',
-    'run with sk-proj-abcdef0123456789abcdef0123456789',
     'github_pat_11ABCDEFG0abcdefghijklmnop',
     'key is\n-----BEGIN RSA PRIVATE KEY-----',
   ]
@@ -159,11 +158,87 @@ test('assertNoSecrets finds a credential anywhere in the value, not only at posi
   }
 })
 
+// Anthropic and OpenAI project keys are base64url: the body carries "-" and "_"
+// as ordinary characters, so it is NOT one long alphanumeric run. Requiring one
+// let roughly a third of real keys through — including every key below, whose
+// longest unbroken alphanumeric stretch is 13 to 19 characters.
+const REAL_PROVIDER_KEYS = [
+  'sk-ant-api03-x7Kd_9fPq2-Lm4Nb_8vCx1-Ze6Yt_3hGw5-Ju0Rs_7dAq2-Bn9Mk_4lZp1AA',
+  'sk-ant-api03-Qw3_Er4-Ty5_Ui6-Op7_As8-Df9_Gh0-Jk1_Lz2-Xc3_Vb4-Nm5_Qa6-Ws7_Ed8-Rf9_Tg0-Yh1_Uj2-Ik3_Ol4AA',
+  'sk-proj-Tf3-Lm9_Qa2Xv7Bn-Zk4Rd8_Wp1Ye6-Hs5Ct0Ju3-Nx7Vg2Mb9_Lq4Kz8Aw1',
+  'sk-proj-9dK_2mQ-4vX_7bN-1zR_8cT-5jH_0pL-3wS_6yF-2gD_9kM-7nB_4xV1',
+]
+
+test('a base64url provider key is a credential even with no long alphanumeric run', () => {
+  for (const key of REAL_PROVIDER_KEYS) {
+    const longestRun = Math.max(...key.split(/[^A-Za-z0-9]/).map((s) => s.length))
+    assert.ok(longestRun < 20, `fixture ${key} has a ${longestRun}-char run — not representative of a base64url key`)
+    assert.throws(() => assertNoSecrets({ ...VALID, note: key }), /"note"/, `leaked ${key}`)
+    assert.throws(() => assertNoSecrets({ ...VALID, note: `ANTHROPIC_API_KEY=${key}` }), /"note"/, `leaked ${key} mid-string`)
+  }
+})
+
+// A fixed seed, so this is a deterministic sweep and not a lottery: the same
+// 800 keys every run. Hand-picked fixtures hid this bug once already — the old
+// one was all-alphanumeric, which no real project key is.
+function makeRng(seed) {
+  let s = seed >>> 0
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0
+    return s / 0x100000000
+  }
+}
+const BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+test('every synthetic provider key is caught, not two thirds of them', () => {
+  const rng = makeRng(20260731)
+  let checked = 0
+  for (const [prefix, length] of [['sk-ant-api03-', 95], ['sk-proj-', 48]]) {
+    for (let i = 0; i < 400; i++) {
+      let body = ''
+      for (let c = 0; c < length; c++) body += BASE64URL[Math.floor(rng() * 64)]
+      const key = prefix + body
+      assert.throws(() => assertNoSecrets({ ...VALID, note: key }), /"note"/, `leaked ${key}`)
+      checked++
+    }
+  }
+  assert.equal(checked, 800)
+})
+
 test('assertNoSecrets covers separator and camelCase spellings of secret keys', () => {
+  // The value is a 40-char hex blob: no vendor prefix, so nothing but the KEY
+  // marks it as a credential. That is the case key-based detection exists for.
+  const opaque = '8f14e45fceea167a5a36dedd4bea25436a1f7e2c'
   const keys = ['api_key', 'api-key', 'apiKey', 'API_KEY', 'private_key', 'private-key', 'privateKey', 'githubPat', 'github_pat', 'pat', 'credential', 'credentials']
   for (const key of keys) {
-    assert.throws(() => assertNoSecrets({ ...VALID, [key]: 'anything' }), new RegExp(key), `accepted secret-shaped key "${key}"`)
+    assert.throws(() => assertNoSecrets({ ...VALID, [key]: opaque }), new RegExp(key), `accepted secret-shaped key "${key}"`)
   }
+})
+
+test('a key that names a secret is not a key that contains one', () => {
+  // Every one of these hard-failed startup with a message accusing the team of
+  // committing a credential. maxTokens in an LLM review bot's team.json is
+  // about as ordinary as a config key gets, and the last three name WHERE a
+  // secret lives rather than holding one.
+  const ordinary = [
+    ['maxTokens', 4096],
+    ['tokenBudget', 100000],
+    ['tokenLimit', 8000],
+    ['maxOutputTokens', 32000],
+    ['tokenizerModel', 'cl100k'],
+    ['apiKeyEnvVar', 'ANTHROPIC_API_KEY'],
+    ['credentialHelper', 'osxkeychain'],
+    ['secretsManagerPath', '/run/secrets/gh-app'],
+  ]
+  for (const [key, value] of ordinary) {
+    assert.doesNotThrow(
+      () => assertNoSecrets({ ...VALID, [key]: value }),
+      `rejected ordinary config ${key}=${JSON.stringify(value)}`
+    )
+  }
+  // Same keys, real credentials: narrowing the key rule must not disarm it.
+  assert.throws(() => assertNoSecrets({ ...VALID, tokenBudget: '8f14e45fceea167a5a36dedd4bea25436a1f7e2c' }), /tokenBudget/)
+  assert.throws(() => assertNoSecrets({ ...VALID, apiKeyEnvVar: REAL_PROVIDER_KEYS[0] }), /apiKeyEnvVar/)
 })
 
 test('assertNoSecrets does not flag ordinary config values', () => {

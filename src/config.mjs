@@ -26,16 +26,54 @@ const SECRET_VALUE_RE = new RegExp(
     // "xox", so the body only has to be more than a mention of the prefix.
     'xox[baprs]-[A-Za-z0-9-]{10,}',
     // GitHub: ghp_/gho_/ghs_/ghu_/ghr_ plus 36 alphanumerics; fine-grained PATs
-    // are github_pat_ plus a much longer alphanumeric/underscore body.
+    // are github_pat_ plus a much longer alphanumeric/underscore body. These
+    // bodies really are alphanumeric — GitHub's alphabet has no "-" or "_" —
+    // so widening them the way the sk- family needs would only cost accuracy.
     'gh[posur]_[A-Za-z0-9]{20,}',
     'github_pat_[A-Za-z0-9_]{20,}',
-    // Model-provider keys: sk-, sk-proj-, sk-ant-api03- … then a long
-    // alphanumeric run. Hyphenated words never reach the run length, so
-    // "sk-clones" and "sk-cache-of-review-clones" are ordinary strings.
-    'sk-(?:[A-Za-z0-9]+-)*[A-Za-z0-9]{20,}',
+    // Model-provider keys are BASE64URL: "-" and "_" are ordinary characters
+    // inside the body, not separators between words. Demanding one long
+    // alphanumeric run therefore missed about a third of real keys — a
+    // sk-ant-api03- key's longest unbroken run is routinely 13 characters.
+    // The two vendor prefixes below are unmistakable, so they only need a body.
+    'sk-ant-api\\d{2}-[A-Za-z0-9_-]{20,}',
+    'sk-proj-[A-Za-z0-9_-]{20,}',
+    // Classic sk- keys, and anything else that reaches a 20-run.
+    'sk-(?:[A-Za-z0-9_]+-)*[A-Za-z0-9_]{20,}',
+    // Backstop for prefixes no one has published yet: a long base64url body
+    // carrying both capitals and digits is random key material. Kebab-case
+    // paths and repo names are neither long enough nor mixed — "sk-clones" and
+    // "sk-cache-of-review-clones" stop at 22 characters, all lowercase.
+    'sk-(?=[A-Za-z0-9_-]{32,})(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\\d)[A-Za-z0-9_-]{32,}',
     '-----BEGIN',
   ].join('|')
 )
+
+// A key can only NAME a secret; the value is the secret. Key-based detection
+// stays, because it is the only thing that catches a credential in a format
+// nothing recognises — a hex blob, a bare base64 string — but it now needs a
+// value capable of BEING one before it fires. Without that gate, "maxTokens"
+// hard-failed startup with a message accusing the team of committing a
+// credential, and so did apiKeyEnvVar / credentialHelper / secretsManagerPath,
+// which name where a secret lives rather than holding one.
+const OPAQUE_VALUE_RE = /^[A-Za-z0-9+/=_.~-]{16,}$/
+// A leading "/", "~" or "." is a location, not key material.
+const PATH_LIKE_RE = /^[~.]|^\/|^[A-Za-z]:\\/
+// ANTHROPIC_API_KEY names a variable; the secret is whatever it holds.
+const ENV_VAR_NAME_RE = /^[A-Z][A-Z0-9_]*$/
+
+function looksLikeSecretMaterial(value) {
+  // A budget is a number, and no number is a credential.
+  if (typeof value !== 'string') return false
+  const v = value.trim()
+  // Anything with a space is prose; anything under 16 characters is a word
+  // like "osxkeychain" or "cl100k", not key material.
+  if (!OPAQUE_VALUE_RE.test(v) || PATH_LIKE_RE.test(v) || ENV_VAR_NAME_RE.test(v)) return false
+  // Random material carries capitals and digits together, or runs unbroken for
+  // 32 characters. A model id like "claude-sonnet-4-5-20250929" does neither,
+  // and that is exactly what a key named "tokenizerModel" actually holds.
+  return (/[A-Z]/.test(v) && /\d/.test(v)) || /^[A-Za-z0-9]{32,}$/.test(v)
+}
 
 function isSecretShapedKey(key) {
   if (SECRET_KEY_RE.test(key.toLowerCase().replace(/[^a-z]/g, ''))) return true
@@ -72,8 +110,8 @@ export function assertNoSecrets(raw, path = '') {
       assertNoSecrets(value, here)
       continue
     }
-    if (isSecretShapedKey(key)) {
-      throw new Error(`Secret-shaped key "${here}" in ${CONFIG_FILENAME}. Secrets belong in ~/.config/pr-review-bot/.env, never in config.`)
+    if (isSecretShapedKey(key) && looksLikeSecretMaterial(value)) {
+      throw new Error(`Secret-shaped key "${here}" in ${CONFIG_FILENAME} carries what looks like a credential. Secrets belong in ~/.config/pr-review-bot/.env, never in config.`)
     }
     if (typeof value === 'string' && SECRET_VALUE_RE.test(value)) {
       throw new Error(`Value at "${here}" looks like a credential. Secrets belong in ~/.config/pr-review-bot/.env, never in config.`)

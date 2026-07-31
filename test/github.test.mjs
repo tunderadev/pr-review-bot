@@ -30,7 +30,7 @@ test('client throws TransientError vs FatalError per classification', async () =
 test('listOpenPrs requests open PRs with labels inline, not the search API', async () => {
   const { impl, calls } = stubFetch([{ ok: true, status: 200, json: async () => [{ number: 1 }] }])
   await createGitHub({ token: 't', fetchImpl: impl }).listOpenPrs('o/r')
-  assert.match(calls[0].url, /\/repos\/o\/r\/pulls\?state=open&per_page=100$/)
+  assert.equal(calls[0].url, 'https://api.github.com/repos/o/r/pulls?state=open&per_page=100')
   assert.doesNotMatch(calls[0].url, /search/)
 })
 

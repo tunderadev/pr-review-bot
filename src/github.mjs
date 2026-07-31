@@ -90,19 +90,36 @@ export function createGitHub({ token, fetchImpl = fetch, baseUrl = 'https://api.
     return data
   }
 
-  // Silent truncation is the worst outcome here: a ledger comment past page 1
-  // reads as "never reviewed", so the bot re-announces and re-reviews forever.
-  async function apiPaged(path) {
+  // Collects up to MAX_PAGES and says whether it stopped early. What to do
+  // about that is the caller's decision, because it differs per endpoint.
+  async function collectPages(path) {
     const items = []
     let url = `${baseUrl}${path}`
     for (let fetched = 0; fetched < MAX_PAGES; fetched++) {
       const { data, res } = await request(url, { label: path })
-      items.push(...(data ?? []))
+      // A 200 can still carry an object — {"message": …} on a redirect, or a
+      // proxy's error envelope. Spreading it threw a raw TypeError: neither
+      // TransientError nor FatalError, so it landed on the sticky
+      // never-retried label naming neither the endpoint nor the cause.
+      if (!Array.isArray(data)) {
+        throw new FatalError(`GitHub GET ${path} returned ${data === null ? 'null' : typeof data} where a list was expected`)
+      }
+      items.push(...data)
       const next = nextPageUrl(res.headers?.get?.('link'), path)
-      if (!next) return items
+      if (!next) return { items, truncated: false }
       url = next
     }
-    throw new FatalError(`GitHub GET ${path} still had a next page after ${MAX_PAGES} pages; refusing to return a truncated list`)
+    return { items, truncated: true }
+  }
+
+  // Silent truncation is the worst outcome here: a ledger comment past page 1
+  // reads as "never reviewed", so the bot re-announces and re-reviews forever.
+  async function apiPaged(path) {
+    const { items, truncated } = await collectPages(path)
+    if (truncated) {
+      throw new FatalError(`GitHub GET ${path} still had a next page after ${MAX_PAGES} pages; refusing to return a truncated list`)
+    }
+    return items
   }
 
   return {
@@ -110,7 +127,15 @@ export function createGitHub({ token, fetchImpl = fetch, baseUrl = 'https://api.
     // which would randomly delay label pickup.
     listOpenPrs: (repo) => apiPaged(`/repos/${repo}/pulls?state=open&per_page=100`),
     listReviews: (repo, number) => apiPaged(`/repos/${repo}/pulls/${number}/reviews?per_page=100`),
-    listPrFiles: (repo, number) => apiPaged(`/repos/${repo}/pulls/${number}/files?per_page=100`),
+    // The odd one out: a legitimately large PR — a lockfile regen, a codemod, a
+    // vendored directory — must not be benched by the sticky never-retried
+    // label over a deterministic condition no retry can clear. The pipeline
+    // already truncates diffs by design via maxDiffLines and names what it
+    // skipped, so it reports truncation instead of throwing.
+    async listPrFiles(repo, number) {
+      const { items, truncated } = await collectPages(`/repos/${repo}/pulls/${number}/files?per_page=100`)
+      return { files: items, truncated }
+    },
     listIssueComments: (repo, number) => apiPaged(`/repos/${repo}/issues/${number}/comments?per_page=100`),
     createIssueComment: (repo, number, body) => api(`/repos/${repo}/issues/${number}/comments`, { method: 'POST', body: { body } }),
     updateIssueComment: (repo, commentId, body) => api(`/repos/${repo}/issues/comments/${commentId}`, { method: 'PATCH', body: { body } }),

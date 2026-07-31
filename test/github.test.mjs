@@ -22,13 +22,21 @@ function stubFetch(responses) {
 const header = (headers, name) => Object.entries(headers).find(([k]) => k.toLowerCase() === name)?.[1]
 const page = (items, link) => ({ ok: true, status: 200, json: async () => items, link })
 
-// Every list endpoint, with the exact URL it must request first.
+// Every list endpoint, with the exact URL it must request first and the way to
+// read its items — listPrFiles reports truncation instead of throwing, so it
+// returns { files, truncated } rather than a bare array.
 const LIST_ENDPOINTS = [
-  ['listOpenPrs', (gh) => gh.listOpenPrs('o/r'), 'https://api.github.com/repos/o/r/pulls?state=open&per_page=100'],
-  ['listReviews', (gh) => gh.listReviews('o/r', 7), 'https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100'],
-  ['listPrFiles', (gh) => gh.listPrFiles('o/r', 7), 'https://api.github.com/repos/o/r/pulls/7/files?per_page=100'],
-  ['listIssueComments', (gh) => gh.listIssueComments('o/r', 7), 'https://api.github.com/repos/o/r/issues/7/comments?per_page=100'],
+  ['listOpenPrs', (gh) => gh.listOpenPrs('o/r'), 'https://api.github.com/repos/o/r/pulls?state=open&per_page=100', (r) => r],
+  ['listReviews', (gh) => gh.listReviews('o/r', 7), 'https://api.github.com/repos/o/r/pulls/7/reviews?per_page=100', (r) => r],
+  ['listPrFiles', (gh) => gh.listPrFiles('o/r', 7), 'https://api.github.com/repos/o/r/pulls/7/files?per_page=100', (r) => r.files],
+  ['listIssueComments', (gh) => gh.listIssueComments('o/r', 7), 'https://api.github.com/repos/o/r/issues/7/comments?per_page=100', (r) => r],
 ]
+
+// A truncated list of these corrupts the memory model: a ledger comment or a
+// bot review past the cap reads as "never reviewed" and the PR is reviewed
+// again. listOpenPrs throws during discovery, before any PR is claimed, so it
+// aborts the cycle without labelling anything.
+const MUST_NOT_TRUNCATE = LIST_ENDPOINTS.filter(([name]) => name !== 'listPrFiles')
 
 test('classifyStatus treats 429, 5xx, and rate-limit 403 as transient', () => {
   assert.equal(classifyStatus(429, ''), 'transient')
@@ -143,7 +151,7 @@ test('apiPaged refuses to treat an unparseable next link as the last page', asyn
   })
 })
 
-for (const [name, call, url] of LIST_ENDPOINTS) {
+for (const [name, call, url, items] of LIST_ENDPOINTS) {
   test(`${name} requests exactly ${url}`, async () => {
     const { impl, calls } = stubFetch([page([])])
     await call(createGitHub({ token: 't', fetchImpl: impl }))
@@ -157,13 +165,30 @@ for (const [name, call, url] of LIST_ENDPOINTS) {
       page([{ id: 1 }], `<${nextUrl}>; rel="next", <${url}&page=9>; rel="last"`),
       page([{ id: 2 }]),
     ])
-    const items = await call(createGitHub({ token: 't', fetchImpl: impl }))
-    assert.deepEqual(items, [{ id: 1 }, { id: 2 }])
+    const result = await call(createGitHub({ token: 't', fetchImpl: impl }))
+    assert.deepEqual(items(result), [{ id: 1 }, { id: 2 }])
     assert.equal(calls.length, 2)
     assert.equal(calls[1].url, nextUrl)
     assert.equal(header(calls[1].headers, 'authorization'), 'Bearer t', 'page 2 must be authenticated too')
   })
 
+  test(`${name} refuses to spread a non-array 200 body`, async () => {
+    // A 200 carrying {"message": …} spread as a raw TypeError: neither
+    // TransientError nor FatalError, so the sticky never-retried label, with a
+    // message naming neither the endpoint nor the cause.
+    for (const body of [{ message: 'Moved Permanently' }, null, 'nope']) {
+      const { impl } = stubFetch([{ ok: true, status: 200, json: async () => body }])
+      await assert.rejects(call(createGitHub({ token: 't', fetchImpl: impl })), (e) => {
+        assert.ok(e instanceof FatalError, `expected FatalError, got ${e.constructor.name}`)
+        assert.match(e.message, new RegExp(new URL(url).pathname.replace(/[/]/g, '\\/')), 'the error must name the endpoint')
+        assert.match(e.message, /object|null|string/, 'the error must name what came back')
+        return true
+      }, `spread ${JSON.stringify(body)}`)
+    }
+  })
+}
+
+for (const [name, call, url] of MUST_NOT_TRUNCATE) {
   test(`${name} throws rather than truncating past the page cap`, async () => {
     const endless = Array.from({ length: 12 }, (_, i) => page([{ id: i }], `<${url}&page=${i + 2}>; rel="next"`))
     const { impl, calls } = stubFetch(endless)
@@ -175,6 +200,26 @@ for (const [name, call, url] of LIST_ENDPOINTS) {
     assert.equal(calls.length, 10, 'the cap is 10 pages')
   })
 }
+
+test('listPrFiles reports truncation instead of benching a large PR forever', async () => {
+  // A lockfile regen, a codemod or a vendored directory legitimately exceeds
+  // the cap. Throwing there applies the sticky review-error label from a
+  // deterministic condition no retry can clear, and the pipeline already
+  // truncates diffs by design via maxDiffLines and names what it skipped.
+  const url = 'https://api.github.com/repos/o/r/pulls/7/files?per_page=100'
+  const endless = Array.from({ length: 12 }, (_, i) => page([{ filename: `f${i}` }], `<${url}&page=${i + 2}>; rel="next"`))
+  const { impl, calls } = stubFetch(endless)
+  const result = await createGitHub({ token: 't', fetchImpl: impl }).listPrFiles('o/r', 7)
+  assert.equal(result.truncated, true)
+  assert.equal(result.files.length, 10, 'every page fetched up to the cap is kept')
+  assert.equal(calls.length, 10, 'the cap is still 10 pages')
+})
+
+test('listPrFiles reports truncated:false when the list fits', async () => {
+  const { impl } = stubFetch([page([{ filename: 'a' }, { filename: 'b' }])])
+  const result = await createGitHub({ token: 't', fetchImpl: impl }).listPrFiles('o/r', 7)
+  assert.deepEqual(result, { files: [{ filename: 'a' }, { filename: 'b' }], truncated: false })
+})
 
 test('createReview posts the event and body', async () => {
   const { impl, calls } = stubFetch([{ ok: true, status: 200, json: async () => ({ html_url: 'u' }) }])

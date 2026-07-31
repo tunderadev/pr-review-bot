@@ -47,7 +47,14 @@ export async function refuteBlockers({ findings, pr, cwd, spawnImpl, timeoutMs }
     try {
       const run = await runClaude({ prompt: buildRefutationPrompt({ finding, pr }), cwd, spawnImpl, timeoutMs })
       runs.push(run)
-      verdict = parseRefutation(run.result)
+      // A run the CLI reports as failed is not a verdict in either direction. It
+      // cannot clear the claim — and it cannot confirm one either: putting a
+      // finding in front of the author on the strength of a failed run blocks
+      // them over something nothing actually checked. A quota wall lands here,
+      // and it says nothing whatever about the finding's merit.
+      verdict = run.isError
+        ? { refuted: true, why: 'not verified: the refutation could not be completed', unverified: true }
+        : { ...parseRefutation(run.result), unverified: false }
     } catch (e) {
       // A timeout is the same kind of event as an unreadable answer: nobody
       // produced a verdict, so the refute-by-default bias applies and the finding
@@ -66,10 +73,28 @@ export async function refuteBlockers({ findings, pr, cwd, spawnImpl, timeoutMs }
       // The elapsed time and the budget stay in the run rather than being
       // interpolated here — this string may end up in a public comment, and
       // runClaude's message names the local worktree path.
-      verdict = { refuted: true, why: 'not verified: the refutation timed out' }
+      verdict = { refuted: true, why: 'not verified: the refutation timed out', unverified: true }
     }
-    if (verdict.refuted) refuted.push({ ...finding, refutation: verdict.why })
+    if (verdict.refuted) refuted.push({ ...finding, refutation: verdict.why, unverified: verdict.unverified })
     else survivors.push({ ...finding, confirmation: verdict.why })
   }
-  return { survivors, refuted, runs }
+  // Refute-by-default is right when the model looked and could not substantiate
+  // the claim: that is real uncertainty, and uncertainty must not block a PR. It
+  // is NOT right when the refutation never happened — a timeout or a failed run
+  // drops a finding for reasons that have nothing to do with its merit, and the
+  // caller then sees zero survivors and posts an approval on a PR that may have
+  // real defects. That is the worst thing this tool can do, and it is silent.
+  //
+  // So the pass reports whether any blocker was dropped unverified. Derived from
+  // the per-finding record rather than tracked separately, so the flag and the
+  // reasons rendered into the review body cannot drift apart. A model that
+  // answered successfully but unreadably is deliberately NOT degraded.
+  //
+  // The rule this is built for (Task 13): degraded with no survivors must not
+  // approve — restore the trigger label and retry next cycle, as for a usage
+  // limit, because the correct verdict is genuinely unknown. Degraded WITH
+  // survivors is safe to post: requesting changes on what was confirmed is still
+  // actionable, which is why this is a flag and not a throw.
+  const degraded = refuted.some((f) => f.unverified)
+  return { survivors, refuted, runs, degraded }
 }

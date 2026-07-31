@@ -6,6 +6,9 @@ import { buildRefutationPrompt, parseRefutation, refuteBlockers } from '../src/v
 
 const PR = { repo: 'o/r', number: 7, headSha: 'abc1234' }
 const blocking = (claim) => ({ severity: 'blocking', file: 'src/a.ts', line: 1, claim, why: 'w' })
+// A run the CLI reports as failed: the refutation never happened, whatever the
+// text says.
+const errorRun = (text) => ({ result: text, is_error: true, subtype: 'error_during_execution', usage: {}, total_cost_usd: 0, duration_ms: 1 })
 
 function fakeSpawn(results) {
   const calls = []
@@ -16,7 +19,12 @@ function fakeSpawn(results) {
     calls.push(call)
     child.stdin = new Writable({ write(c, e, cb) { call.prompt += c; cb() }, final(cb) { cb() } })
     const result = results.shift()
-    child.stdout = Readable.from([JSON.stringify({ result, is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1, subtype: 'success' })])
+    // A string is a successful answer; an object is a whole envelope, so a test
+    // can produce a run the CLI itself failed on.
+    const envelope = result !== null && typeof result === 'object'
+      ? result
+      : { result, is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1, subtype: 'success' }
+    child.stdout = Readable.from([JSON.stringify(envelope)])
     child.stderr = Readable.from([])
     child.kill = (signal) => { killed.push(signal); return true }
     // A `null` result is a wedged child: it never closes, so only the timeout
@@ -169,6 +177,83 @@ test('a refuter that errored out leaves a marked run, so a caller can tell clear
   assert.deepEqual(out.refuted.map((f) => f.claim), ['real'])
   assert.equal(out.runs.length, 1)
   assert.equal(out.runs[0].isError, true, 'an unverified drop is distinguishable from a verified one')
+})
+
+// --- `degraded`: was a blocker dropped because the model cleared it, or because
+// the refutation never happened? Zero survivors means an approval downstream, so
+// the two cases must not look alike.
+
+test('a pass where every blocker timed out is degraded, not a clean bill of health', async () => {
+  const impl = fakeSpawn([null, null])
+  const out = await refuteBlockers({ findings: [blocking('a'), blocking('b')], pr: PR, cwd: '/wt', spawnImpl: impl, timeoutMs: 25 })
+  assert.deepEqual(out.survivors, [])
+  assert.equal(out.degraded, true, 'nothing was checked; this must not read as approval')
+  assert.deepEqual(out.refuted.map((f) => f.claim), ['a', 'b'])
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [true, true])
+})
+
+test('a pass where every refutation errored out is degraded', async () => {
+  // The quota wall is the realistic one: it arrives mid-pass and has nothing to
+  // do with whether the findings are real.
+  const impl = fakeSpawn([errorRun('Claude AI usage limit reached'), errorRun('Claude AI usage limit reached')])
+  const out = await refuteBlockers({ findings: [blocking('a'), blocking('b')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.deepEqual(out.survivors, [])
+  assert.equal(out.degraded, true)
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [true, true])
+  assert.deepEqual(out.runs.map((r) => r.isError), [true, true])
+})
+
+test('a pass where the model answered every time but unreadably is NOT degraded', async () => {
+  // The discriminating case. The model ran, read the code, and failed to
+  // substantiate the claims — that is real uncertainty, and the refute-by-default
+  // bias is exactly right for it. Flagging this as degraded would make `degraded`
+  // a synonym for `refuted.length > 0` and strip it of meaning.
+  const impl = fakeSpawn(['I could not find a path to that failure, honestly.', 'Seems fine? Hard to say.'])
+  const out = await refuteBlockers({ findings: [blocking('a'), blocking('b')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.deepEqual(out.survivors, [])
+  assert.deepEqual(out.refuted.map((f) => f.claim), ['a', 'b'])
+  assert.equal(out.degraded, false, 'a model that answered is not an infrastructure failure')
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [false, false])
+})
+
+test('one genuine refutation plus one timeout is degraded', async () => {
+  const impl = fakeSpawn(['{"refuted":true,"why":"guarded upstream"}', null])
+  const out = await refuteBlockers({ findings: [blocking('cleared'), blocking('never checked')], pr: PR, cwd: '/wt', spawnImpl: impl, timeoutMs: 25 })
+  assert.equal(out.degraded, true, 'one unchecked blocker is enough to make an approval unsafe')
+  assert.deepEqual(out.refuted.map((f) => f.claim), ['cleared', 'never checked'])
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [false, true], 'per finding, not per pass')
+  assert.equal(out.refuted[0].refutation, 'guarded upstream')
+  assert.match(out.refuted[1].refutation, /not verified/i, 'Task 12 renders these; the two must not read alike')
+})
+
+test('a pass where every refutation returned a real verdict is not degraded', async () => {
+  const impl = fakeSpawn(['{"refuted":false,"why":"traced it"}', '{"refuted":true,"why":"guarded"}'])
+  const out = await refuteBlockers({ findings: [blocking('real'), blocking('bogus')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.deepEqual(out.survivors.map((f) => f.claim), ['real'])
+  assert.deepEqual(out.refuted.map((f) => f.claim), ['bogus'])
+  assert.equal(out.degraded, false, 'a working pass must never look degraded, or the flag gets ignored')
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [false])
+})
+
+test('zero blocking findings is not a degraded pass', async () => {
+  // Nothing was dropped, so there is nothing unverified — and still no spawn.
+  const impl = fakeSpawn([])
+  const out = await refuteBlockers({ findings: [{ severity: 'nit', file: 'f', line: 1, claim: 'n', why: 'w' }], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(out.degraded, false, 'the clean PR is the common case; it must not ask for a retry')
+  assert.equal(impl.calls.length, 0)
+  assert.deepEqual(out.survivors, [])
+  assert.deepEqual(out.refuted, [])
+})
+
+test('an errored run cannot confirm a blocker any more than it can refute one', async () => {
+  // A failed run whose text happens to parse is still not a verdict. Letting it
+  // through would block a colleague on a claim nothing verified — and it would
+  // do so with degraded false, so nothing downstream could tell.
+  const impl = fakeSpawn([errorRun('{"refuted":false,"why":"looks real to me"}')])
+  const out = await refuteBlockers({ findings: [blocking('real')], pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.deepEqual(out.survivors, [], 'a failed run must not put a finding in front of the author')
+  assert.deepEqual(out.refuted.map((f) => f.unverified), [true])
+  assert.equal(out.degraded, true)
 })
 
 test('parseRefutation refuses to read a verdict out of a non-boolean or a missing field', () => {

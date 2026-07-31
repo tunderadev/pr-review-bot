@@ -71,28 +71,30 @@ test('parseState survives blocker claims containing the end marker -->', () => {
   assert.deepEqual(parseState(renderStateComment(stateWithArrow)), stateWithArrow)
 })
 
-test('parseState ignores quoted marker text and parses the real block', () => {
+// A markdown quote of a comment this tool actually rendered — base64 payload
+// and all. Node's base64 decoder silently discards the "> " prefixes, so a
+// quoted block decodes cleanly and is caught only by the BASE64_ONLY guard.
+const quote = (text) => text.split('\n').map((line) => `> ${line}`).join('\n')
+
+const OTHER_STATE = {
+  version: STATE_VERSION,
+  slack: { channel: 'C-OTHER', ts: '1600000000.000000', stateEmoji: 'eyes' },
+  criteriaVersion: 'sha256:ffff',
+  rounds: [{ round: 1, sha: 'def5678', verdict: 'approved', at: '2026-07-29T19:00:00Z', blockers: [] }],
+}
+
+test('parseState ignores a quoted post-base64 block preceding the real one', () => {
   const stateForBlock = {
     version: STATE_VERSION,
     slack: null,
     criteriaVersion: null,
     rounds: [{ round: 1, sha: 'def5678', verdict: 'approved', at: '2026-07-29T19:00:00Z', blockers: [] }],
   }
-  const renderedBlock = renderStateComment(stateForBlock)
-  // Simulate a quoted prior comment containing the marker
-  const bodyWithQuotedMarker = `> Previous review:
-> <!-- pr-review-bot:state
-> {"version":1}
-> -->
-
-${renderedBlock}`
-  assert.deepEqual(parseState(bodyWithQuotedMarker), stateForBlock)
+  const body = `> Previous review:\n${quote(renderStateComment(OTHER_STATE))}\n\n${renderStateComment(stateForBlock)}`
+  assert.deepEqual(parseState(body), stateForBlock)
 })
 
-const QUOTED_BLOCK = `> Previous review:
-> <!-- pr-review-bot:state
-> {"version":1}
-> -->`
+const QUOTED_BLOCK = `> Previous review:\n${quote(renderStateComment(OTHER_STATE))}`
 
 function stateWithClaim(claim) {
   return {
@@ -131,4 +133,61 @@ test('the hidden block payload cannot contain a comment delimiter', () => {
 test('parseState returns null for an unknown version inside a well-formed block', () => {
   const encoded = Buffer.from(JSON.stringify({ version: 99, rounds: [] })).toString('base64')
   assert.equal(parseState(`<!-- pr-review-bot:state\n${encoded}\n-->`), null)
+})
+
+const block = (payloadObject) =>
+  `<!-- pr-review-bot:state\n${Buffer.from(JSON.stringify(payloadObject)).toString('base64')}\n-->`
+
+test('parseState reads the FIRST decodable block, so an appended one cannot take over', () => {
+  // Anyone who can edit the sticky comment can append a block of their own.
+  // Reading the last one lets it replace the bot's own memory: a forged Slack
+  // binding redirects every future update into a channel of their choosing.
+  const forged = { version: STATE_VERSION, slack: { channel: 'ATTACKER', ts: '1.1' }, criteriaVersion: null, rounds: [] }
+  const body = `${renderStateComment(state)}\n\n${block(forged)}`
+  assert.deepEqual(parseState(body), state, 'the bot-written block comes first and must win')
+})
+
+test('re-pasting an older sticky body below the current one does not roll history back', () => {
+  // Rolling back to round 1 makes the bot re-announce and re-review work it
+  // has already reviewed, at the author's expense.
+  const older = { ...state, rounds: state.rounds.slice(0, 1) }
+  const newer = appendRound(older, { sha: 'def5678', verdict: 'approved', at: '2026-07-29T20:00:00Z', blockers: [] })
+  const body = `${renderStateComment(newer)}\n\n---\nFor reference, the previous version of this comment:\n\n${renderStateComment(older)}`
+  assert.deepEqual(parseState(body), newer)
+  assert.equal(parseState(body).rounds.length, 2)
+})
+
+test('a corrupted real block returns null rather than falling back to another block', () => {
+  // Healing from emptyState is recoverable; adopting someone else's state is not.
+  const real = renderStateComment(state)
+  const corrupted = real.slice(0, real.length - 12) + '\n-->'
+  const body = `${QUOTED_BLOCK}\n\n${corrupted}`
+  assert.equal(parseState(body), null)
+})
+
+test('parseState returns null for a version-correct payload of the wrong shape', () => {
+  // lastRound, appendRound and renderLedger all dereference these. A raw
+  // TypeError is not a TransientError, so it applies the sticky review-error
+  // label that is never auto-retried — over a comment the bot can just rebuild.
+  const wrongShapes = [
+    { version: STATE_VERSION },
+    { version: STATE_VERSION, rounds: 'nope' },
+    { version: STATE_VERSION, rounds: {} },
+    { version: STATE_VERSION, rounds: [], slack: 'C0123ABC' },
+    { version: STATE_VERSION, rounds: [], slack: [] },
+    { version: STATE_VERSION, rounds: [null] },
+    { version: STATE_VERSION, rounds: [{ round: 1, sha: 'abc1234', verdict: 'approved', at: 'now' }] },
+    { version: STATE_VERSION, rounds: [{ round: 1, verdict: 'approved', at: 'now', blockers: [] }] },
+  ]
+  for (const payload of wrongShapes) {
+    assert.equal(parseState(block(payload)), null, `accepted ${JSON.stringify(payload)}`)
+  }
+  assert.equal(parseState(2), null, 'a non-string body is not a comment')
+  assert.equal(parseState('<!-- pr-review-bot:state\n\n-->'), null, 'an empty payload is not state')
+  assert.equal(parseState(`<!-- pr-review-bot:state\n${Buffer.from('{"version":1,"rounds":[]').toString('base64')}\n-->`), null, 'truncated JSON')
+})
+
+test('a shape-valid payload still round-trips, including a state with no rounds', () => {
+  assert.deepEqual(parseState(renderStateComment(emptyState())), emptyState())
+  assert.deepEqual(parseState(renderStateComment(OTHER_STATE)), OTHER_STATE)
 })

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { Readable, Writable } from 'node:stream'
-import { buildReviewPrompt, parseVerdict, VerdictParseError, runClaude, isUsageLimit, runReview } from '../src/review.mjs'
+import { buildReviewPrompt, parseVerdict, VerdictParseError, runClaude, isUsageLimit, runReview, ReviewTimeoutError, DEFAULT_REVIEW_TIMEOUT_MS } from '../src/review.mjs'
 
 const PR = { repo: 'o/r', number: 7, title: '[PLAT] add widget', author: 'octocat', headSha: 'abc1234', url: 'u' }
 
@@ -22,6 +22,22 @@ function fakeSpawn(envelopes) {
     return child
   }
   return { impl, seen }
+}
+
+// A child that never closes: the wedged review the timeout exists to bound.
+function hungSpawn() {
+  const killed = []
+  let spawns = 0
+  const impl = () => {
+    spawns += 1
+    const child = new EventEmitter()
+    child.stdin = new Writable({ write(c, e, cb) { cb() }, final(cb) { cb() } })
+    child.stdout = Readable.from([])
+    child.stderr = Readable.from([])
+    child.kill = (signal) => { killed.push(signal); return true }
+    return child
+  }
+  return { impl, killed, spawns: () => spawns }
 }
 
 const goodVerdict = {
@@ -152,6 +168,39 @@ test('a quota exhaustion is not charged to the PR: no retry, and the run is reco
   assert.equal(isUsageLimit(err.run), true, 'the caller can take the transient path')
 })
 
+test('a retried review reports every run, so telemetry sees what the retry cost', async () => {
+  const bad = { subtype: 'success', is_error: false, result: 'no json here', usage: { input_tokens: 100, output_tokens: 5 }, total_cost_usd: 0.02, duration_ms: 11 }
+  const good = { subtype: 'success', is_error: false, result: JSON.stringify(goodVerdict), usage: { input_tokens: 120, output_tokens: 60 }, total_cost_usd: 0.03, duration_ms: 22 }
+  const { impl } = fakeSpawn([bad, good])
+
+  const out = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl })
+
+  // A retried review is the expensive kind. Reporting only the attempt that
+  // happened to parse understates the cost of exactly those reviews.
+  assert.equal(out.runs.length, 2, 'both attempts are reported')
+  assert.deepEqual(out.runs.map((r) => r.costUsd), [0.02, 0.03], 'the discarded attempt still cost money')
+  assert.deepEqual(out.runs.map((r) => r.durationMs), [11, 22])
+  assert.deepEqual(out.runs.map((r) => r.usage.input_tokens), [100, 120])
+  assert.equal(out.run, out.runs.at(-1), 'run stays available, as the last attempt')
+})
+
+test('a review that parses first time reports exactly one run', async () => {
+  const good = { subtype: 'success', is_error: false, result: JSON.stringify(goodVerdict), usage: {}, total_cost_usd: 0.03, duration_ms: 22 }
+  const out = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: fakeSpawn([good]).impl })
+  assert.equal(out.runs.length, 1)
+  assert.equal(out.runs[0].costUsd, 0.03)
+})
+
+test('a review that fails outright still reports the runs it burned', async () => {
+  const bad = { subtype: 'success', is_error: false, result: 'prose only', usage: {}, total_cost_usd: 0.02, duration_ms: 11 }
+  const err = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: fakeSpawn([bad, bad]).impl }).then(
+    () => null,
+    (e) => e,
+  )
+  assert.ok(err instanceof VerdictParseError)
+  assert.deepEqual(err.runs.map((r) => r.costUsd), [0.02, 0.02], 'a review that produced nothing still spent quota')
+})
+
 test('isUsageLimit discriminates within errors, and does not fire on quota words in a passing run', () => {
   // Would pass for `run => Boolean(run.isError)`: an ordinary tool failure.
   assert.equal(isUsageLimit({ isError: true, result: 'Error: ENOENT: no such file or directory' }), false)
@@ -160,6 +209,10 @@ test('isUsageLimit discriminates within errors, and does not fire on quota words
   assert.equal(isUsageLimit({ isError: false, result: '{"summary":"adds a rate limit to the API"}' }), false)
   assert.equal(isUsageLimit({ isError: true, result: 'Request failed with status 429' }), true)
   assert.equal(isUsageLimit({ isError: true }), false, 'a missing result is not a quota event')
+  // Digits inside a duration are not an HTTP status. This one is load-bearing:
+  // the timeout message below carries an elapsed time, and reading a hung
+  // review as a quota event would put it on the transient path forever.
+  assert.equal(isUsageLimit({ isError: true, result: 'claude timed out after 1429ms (limit 1200000ms)' }), false)
 })
 
 test('runClaude reports a success envelope as a success and an error envelope as an error', async () => {
@@ -232,6 +285,56 @@ test('previousBlockersResolved is always an array the caller can iterate', () =>
   // iterates it turns a bad verdict into a crash one layer down.
   assert.throws(() => parseVerdict(withShape('all fixed')), VerdictParseError)
   assert.throws(() => parseVerdict(withShape({ claim: 'x' })), VerdictParseError)
+})
+
+test('a hung claude is killed and reported as a per-PR failure, not a transient one', async () => {
+  const hung = hungSpawn()
+  const err = await runClaude({ prompt: 'p', cwd: '/wt', spawnImpl: hung.impl, timeoutMs: 25 }).then(
+    () => null,
+    (e) => e,
+  )
+  assert.ok(err instanceof ReviewTimeoutError, 'a wedged child must not resolve as an ordinary run')
+  assert.match(err.message, /timed out/i)
+  assert.match(err.message, /limit 25ms/, 'the message names the budget it blew')
+  assert.match(err.message, /after \d+ms/, 'and how long it actually ran, for the human reading the label')
+  assert.deepEqual(hung.killed, ['SIGKILL'], 'no orphan left holding the worktree open')
+  // The sticky review-error label stops after one occurrence and surfaces the
+  // problem. The transient path would retry this every cycle, forever, on the
+  // operator's personal quota, with nobody ever seeing a signal.
+  assert.equal(isUsageLimit(err.run), false, 'a hung review is this PR\'s problem, not a quota event')
+})
+
+test('a review that finishes is not killed by its own timeout afterwards', async () => {
+  const killed = []
+  const good = { subtype: 'success', is_error: false, result: 'ok', usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const base = fakeSpawn([good])
+  const impl = (...args) => {
+    const child = base.impl(...args)
+    child.kill = (signal) => killed.push(signal)
+    return child
+  }
+  const out = await runClaude({ prompt: 'p', cwd: '/wt', spawnImpl: impl, timeoutMs: 10 })
+  assert.equal(out.result, 'ok')
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  assert.deepEqual(killed, [], 'the timer must be cleared when the child closes')
+})
+
+test('runReview does not re-ask a hung review, and still reports the attempt it burned', async () => {
+  const hung = hungSpawn()
+  const err = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: hung.impl, timeoutMs: 25 }).then(
+    () => null,
+    (e) => e,
+  )
+  assert.ok(err instanceof ReviewTimeoutError)
+  assert.ok(!(err instanceof VerdictParseError), 'nothing to re-ask: the child never answered')
+  assert.equal(hung.spawns(), 1, 'a wedged review is not asked twice')
+  assert.equal(err.runs.length, 1, 'the burned attempt is still reported to telemetry')
+  assert.equal(err.runs[0].timedOut, true)
+})
+
+test('the default review timeout is generous enough for a deep review of a large PR', () => {
+  // Pins the unit as much as the number: 20 * 1000 would kill legitimate reviews.
+  assert.equal(DEFAULT_REVIEW_TIMEOUT_MS, 20 * 60 * 1000, 'twenty minutes, in milliseconds')
 })
 
 test('a first-round prompt says so, and names no excluded files when none were skipped', () => {

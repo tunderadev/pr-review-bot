@@ -78,14 +78,54 @@ export function parseVerdict(text) {
 // No --model: headless children inherit the operator's saved CLI default.
 const CLAUDE_ARGS = ['-p', '--output-format', 'json', '--allowed-tools', 'Read Grep Glob']
 
-export function runClaude({ prompt, cwd, spawnImpl = spawn }) {
+// A deep review of a large PR is legitimately slow, so this is generous: it
+// exists to bound a WEDGED child, not a slow one.
+export const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60_000
+
+// Deliberately NOT a usage-limit-shaped failure. A timeout is classified as a
+// per-PR failure and earns the sticky review-error label, because this tool
+// polls every few minutes on a developer's laptop and spends their personal
+// subscription quota — the same quota funding their interactive work. A hung
+// review treated as transient would be retried every cycle indefinitely,
+// burning that quota with nobody ever seeing a signal, whereas a sticky label
+// stops after one occurrence and surfaces the problem to a human. The likeliest
+// cause is PR-specific anyway (a pathological or enormous diff), which is
+// exactly what the per-PR label is for.
+export class ReviewTimeoutError extends Error {}
+
+export function runClaude({ prompt, cwd, spawnImpl = spawn, timeoutMs = DEFAULT_REVIEW_TIMEOUT_MS }) {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
     const child = spawnImpl('claude', CLAUDE_ARGS, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
     let out = ''
     let err = ''
+    let settled = false
+    // One settlement, and the timer dies with it: a child that closes normally
+    // must not be killed minutes later, and a killed child's own 'close' must
+    // not overwrite the timeout with a bland exit code.
+    const settle = (finish, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      finish(value)
+    }
+    const timer = setTimeout(() => {
+      const durationMs = Date.now() - startedAt
+      // SIGKILL rather than SIGTERM: this child is wedged, it holds nothing
+      // worth flushing (it may Read, Grep and Glob and nothing else), and a
+      // TERM it is too stuck to handle would leave an orphan holding the
+      // worktree open against the next cycle's cleanup.
+      child.kill?.('SIGKILL')
+      // Named budget and elapsed time, because a human reading the review-error
+      // label needs to know the review hung rather than guess at it.
+      const message = `claude timed out after ${durationMs}ms (limit ${timeoutMs}ms) reviewing ${cwd}`
+      settle(reject, Object.assign(new ReviewTimeoutError(message), {
+        run: { result: message, isError: true, exitCode: null, usage: {}, costUsd: 0, durationMs, model: null, timedOut: true },
+      }))
+    }, timeoutMs)
     child.stdout.on('data', (d) => (out += d))
     child.stderr.on('data', (d) => (err += d))
-    child.on('error', reject)
+    child.on('error', (e) => settle(reject, e))
     // A child that dies before it has read the whole prompt breaks the pipe.
     // Unhandled, that 'error' event is an uncaught exception in a process that
     // runs unattended; the close handler below still reports the failed run.
@@ -95,10 +135,10 @@ export function runClaude({ prompt, cwd, spawnImpl = spawn }) {
       try {
         envelope = JSON.parse(out)
       } catch {
-        return resolve({ result: out || err, isError: true, exitCode, usage: {}, costUsd: 0, durationMs: 0, model: null })
+        return settle(resolve, { result: out || err, isError: true, exitCode, usage: {}, costUsd: 0, durationMs: 0, model: null })
       }
       const model = Object.values(envelope.modelUsage || {})[0]?.canonicalModel ?? null
-      resolve({
+      settle(resolve, {
         result: envelope.result ?? '',
         isError: Boolean(envelope.is_error) || envelope.subtype !== 'success',
         exitCode,
@@ -112,29 +152,48 @@ export function runClaude({ prompt, cwd, spawnImpl = spawn }) {
   })
 }
 
+// \b429\b, not 429: this reads error text that carries durations and byte
+// counts, and "timed out after 1429ms" is not a quota event. Reading one as a
+// quota event would put a permanently broken review on the transient path,
+// where nothing stops it being retried every cycle.
 export function isUsageLimit(run) {
-  return Boolean(run.isError) && /usage limit|rate limit|quota|429/i.test(run.result || '')
+  return Boolean(run.isError) && /usage limit|rate limit|quota|\b429\b/i.test(run.result || '')
 }
 
-export async function runReview({ criteria, pr, diff, previousBlockers, skippedFiles, cwd, spawnImpl }) {
+export async function runReview({ criteria, pr, diff, previousBlockers, skippedFiles, cwd, spawnImpl, timeoutMs }) {
   const prompt = buildReviewPrompt({ criteria, pr, diff, previousBlockers, skippedFiles })
-  let run = await runClaude({ prompt, cwd, spawnImpl })
+  // Every attempt is reported, not just the one that parsed. Telemetry exists to
+  // answer "can I afford the deeper review mode?", and a retried review is the
+  // expensive kind: dropping the first attempt understates the cost of exactly
+  // the reviews that cost the most. `runs` is the contract; `run` is the last.
+  const runs = []
+  const attempt = async (text) => {
+    try {
+      const run = await runClaude({ prompt: text, cwd, spawnImpl, timeoutMs })
+      runs.push(run)
+      return run
+    } catch (e) {
+      if (e.run) runs.push(e.run)
+      throw Object.assign(e, { runs })
+    }
+  }
+  let run = await attempt(prompt)
   try {
-    return { verdict: parseVerdict(run.result), run }
+    return { verdict: parseVerdict(run.result), run, runs }
   } catch (e) {
-    if (!(e instanceof VerdictParseError)) throw e
+    if (!(e instanceof VerdictParseError)) throw Object.assign(e, { runs })
     // A quota wall is not this PR's fault and a second call cannot climb it. The
     // run travels with the error so the caller can restore the trigger label and
     // retry next cycle, instead of applying the sticky error label a human has
     // to clear by hand.
-    if (isUsageLimit(run)) throw Object.assign(e, { run })
+    if (isUsageLimit(run)) throw Object.assign(e, { run, runs })
     const retry = `${prompt}\n\nYour previous response was not valid JSON. Respond with ONLY the JSON object described above.`
-    run = await runClaude({ prompt: retry, cwd, spawnImpl })
+    run = await attempt(retry)
     try {
-      return { verdict: parseVerdict(run.result), run }
+      return { verdict: parseVerdict(run.result), run, runs }
     } catch (e2) {
-      if (!(e2 instanceof VerdictParseError)) throw e2
-      throw Object.assign(e2, { run })
+      if (!(e2 instanceof VerdictParseError)) throw Object.assign(e2, { runs })
+      throw Object.assign(e2, { run, runs })
     }
   }
 }

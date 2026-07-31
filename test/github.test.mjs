@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createGitHub, classifyStatus, TransientError, FatalError } from '../src/github.mjs'
+import { createGitHub, classifyStatus, nextPageUrl, TransientError, FatalError } from '../src/github.mjs'
 
 // Records headers too: without them, deleting the Authorization line from the
 // client left the whole suite green.
@@ -72,11 +72,75 @@ test('a dropped connection is transient, not a sticky never-retried review-error
   })
 })
 
-test('a transport failure without a cause code is still transient', async () => {
-  const fetchImpl = async () => {
-    throw new TypeError('fetch failed')
+test('only known-retryable transport codes are transient', async () => {
+  for (const code of ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']) {
+    const fetchImpl = async () => {
+      throw new TypeError('fetch failed', { cause: { code } })
+    }
+    await assert.rejects(createGitHub({ token: 't', fetchImpl }).listOpenPrs('o/r'), (e) => {
+      assert.ok(e instanceof TransientError, `${code}: expected TransientError, got ${e.constructor.name}`)
+      return true
+    })
   }
-  await assert.rejects(createGitHub({ token: 't', fetchImpl }).createReview('o/r', 7, { event: 'APPROVE', body: 'lgtm' }), TransientError)
+})
+
+test('a transport failure no retry can clear is fatal, not an endless retry', async () => {
+  // "Transient" means the runner restores the trigger label and tries again
+  // next cycle. A misconfigured base URL, an expired certificate or a bug in a
+  // wrapper is deterministic: retrying it forever surfaces nothing at all.
+  const permanent = [
+    ['bad base URL', new TypeError('Failed to parse URL from //api.github.com/repos/o/r/pulls'), /Failed to parse URL/],
+    ['expired certificate', new TypeError('fetch failed', { cause: { code: 'CERT_HAS_EXPIRED' } }), /CERT_HAS_EXPIRED/],
+    ['buggy wrapper', new ReferenceError('fetchImpl is not defined'), /fetchImpl is not defined/],
+    ['aborted request', Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }), /aborted/],
+  ]
+  for (const [what, err, messageRe] of permanent) {
+    const fetchImpl = async () => {
+      throw err
+    }
+    await assert.rejects(createGitHub({ token: 't', fetchImpl }).createReview('o/r', 7, { event: 'APPROVE', body: 'lgtm' }), (e) => {
+      assert.ok(e instanceof FatalError, `${what}: expected FatalError, got ${e.constructor.name}`)
+      assert.ok(!(e instanceof TransientError), `${what}: must not be retried forever`)
+      assert.match(e.message, messageRe, `${what}: the original cause must survive`)
+      return true
+    })
+  }
+})
+
+test('nextPageUrl parses a Link header whose URL contains a comma', async () => {
+  // rel="next" is the only thing standing between a partial list and a bot
+  // that reads a ledger comment on page 2 as "never reviewed".
+  const url = 'https://api.github.com/repos/o/r/issues/7/comments?labels=a,b&page=2'
+  assert.equal(nextPageUrl(`<${url}>; rel="next", <${url.replace('page=2', 'page=9')}>; rel="last"`, '/x'), url)
+  assert.equal(nextPageUrl(`<${url}>; rel="prev", <${url}>; rel="last"`, '/x'), null, 'no rel="next" means the last page')
+  assert.equal(nextPageUrl('', '/x'), null)
+  assert.equal(nextPageUrl(undefined, '/x'), null)
+})
+
+test('an unparseable rel="next" is fatal rather than a silent last page', () => {
+  assert.throws(() => nextPageUrl('rel="next"; <https://api.github.com/x?page=2>', '/repos/o/r/pulls'), (e) => {
+    assert.ok(e instanceof FatalError, `expected FatalError, got ${e.constructor.name}`)
+    assert.match(e.message, /\/repos\/o\/r\/pulls/, 'the error must name the endpoint')
+    return true
+  })
+})
+
+test('apiPaged follows a next link whose URL contains a comma', async () => {
+  const first = 'https://api.github.com/repos/o/r/issues/7/comments?per_page=100'
+  const second = `${first}&labels=a,b&page=2`
+  const { impl, calls } = stubFetch([page([{ id: 1 }], `<${second}>; rel="next", <${second}>; rel="last"`), page([{ id: 2 }])])
+  const items = await createGitHub({ token: 't', fetchImpl: impl }).listIssueComments('o/r', 7)
+  assert.deepEqual(items, [{ id: 1 }, { id: 2 }])
+  assert.equal(calls[1].url, second)
+})
+
+test('apiPaged refuses to treat an unparseable next link as the last page', async () => {
+  const { impl } = stubFetch([page([{ id: 1 }], 'rel="next"; <https://api.github.com/x?page=2>')])
+  await assert.rejects(createGitHub({ token: 't', fetchImpl: impl }).listIssueComments('o/r', 7), (e) => {
+    assert.ok(e instanceof FatalError, `expected FatalError, got ${e.constructor.name}`)
+    assert.match(e.message, /\/repos\/o\/r\/issues\/7\/comments/, 'the error must name the endpoint')
+    return true
+  })
 })
 
 for (const [name, call, url] of LIST_ENDPOINTS) {

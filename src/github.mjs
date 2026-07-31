@@ -12,14 +12,43 @@ export function classifyStatus(status, bodyText = '') {
 export const MAX_PAGES = 10
 
 // Link: <https://…&page=2>; rel="next", <…>; rel="last"
-export function nextPageUrl(linkHeader) {
+//
+// Splitting on "," severs a URL from its angle brackets the moment a query
+// value contains one (?labels=a,b), and the caller reads the resulting null as
+// "last page" — silent truncation, which is the one outcome pagination exists
+// to prevent. Match <uri>; params pairs instead: the URI is delimited by the
+// brackets, and only the params run stops at a comma.
+const LINK_PAIR_RE = /<([^<>]*)>\s*;\s*([^,<>]*)/g
+const REL_NEXT_RE = /\brel\s*=\s*"?next\b/i
+
+export function nextPageUrl(linkHeader, label = '') {
   if (!linkHeader) return null
-  for (const part of linkHeader.split(',')) {
-    if (!/;\s*rel="?next"?/.test(part)) continue
-    const match = part.match(/<([^>]+)>/)
-    if (match) return match[1]
+  for (const [, uri, params] of linkHeader.matchAll(LINK_PAIR_RE)) {
+    if (REL_NEXT_RE.test(params)) return uri.trim()
+  }
+  // A rel="next" we could not parse means there IS another page. Returning
+  // null here would drop it silently; stopping loudly is the lesser failure.
+  // URI-references are stripped first so a "next" inside a URL cannot fire.
+  if (REL_NEXT_RE.test(linkHeader.replace(/<[^<>]*>/g, ''))) {
+    throw new FatalError(`GitHub GET ${label} returned a Link header with an unparseable rel="next": ${linkHeader}`)
   }
   return null
+}
+
+// A transport failure is only transient if trying again could plausibly work.
+// TransientError makes the runner restore the trigger label and retry next
+// cycle, so a deterministic fault classified transient — a misconfigured base
+// URL, an expired certificate, a bug in a wrapper — retries forever and
+// surfaces nothing. Everything outside this list stops loudly instead.
+const RETRYABLE_TRANSPORT_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'])
+// undici's own failures are timeouts, resets and closed sockets — except these
+// two, which report a bad argument and are as deterministic as a typo.
+const DETERMINISTIC_UNDICI_CODES = new Set(['UND_ERR_INVALID_ARG', 'UND_ERR_NOT_SUPPORTED'])
+
+export function isRetryableTransportCode(code) {
+  if (typeof code !== 'string') return false
+  if (DETERMINISTIC_UNDICI_CODES.has(code)) return false
+  return RETRYABLE_TRANSPORT_CODES.has(code) || code.startsWith('UND_ERR_')
 }
 
 export function createGitHub({ token, fetchImpl = fetch, baseUrl = 'https://api.github.com' }) {
@@ -39,9 +68,15 @@ export function createGitHub({ token, fetchImpl = fetch, baseUrl = 'https://api.
     } catch (err) {
       // A dropped connection throws from fetch itself, so it never reached
       // classifyStatus — and anything that is not a TransientError applies the
-      // sticky review-error label that is never auto-retried.
-      const code = err?.cause?.code
-      throw new TransientError(`GitHub ${method} ${label} transport failure: ${err?.message ?? err}${code ? ` (${code})` : ''}`, { cause: err })
+      // sticky review-error label that is never auto-retried. But catching
+      // everything here was worse: it made a bad baseUrl, an expired
+      // certificate and a ReferenceError in a wrapper all retry forever.
+      // undici reports the errno on err.cause; some errors carry it directly.
+      const code = err?.cause?.code ?? err?.code
+      const message = `GitHub ${method} ${label} transport failure: ${err?.message ?? err}${code ? ` (${code})` : ''}`
+      throw isRetryableTransportCode(code)
+        ? new TransientError(message, { cause: err })
+        : new FatalError(message, { cause: err })
     }
     if (res.ok) return { data: await res.json(), res }
     if (res.status === 404 && tolerate404) return { data: null, res }
@@ -63,7 +98,7 @@ export function createGitHub({ token, fetchImpl = fetch, baseUrl = 'https://api.
     for (let fetched = 0; fetched < MAX_PAGES; fetched++) {
       const { data, res } = await request(url, { label: path })
       items.push(...(data ?? []))
-      const next = nextPageUrl(res.headers?.get?.('link'))
+      const next = nextPageUrl(res.headers?.get?.('link'), path)
       if (!next) return items
       url = next
     }

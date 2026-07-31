@@ -79,6 +79,21 @@ test('validateConfig applies defaults without inventing a model', () => {
   assert.ok(!('model' in c), 'model must not be defaulted')
 })
 
+test('a config that pins a model is rejected, not silently ignored', () => {
+  // It cannot be honoured — headless children inherit the operator's own saved
+  // CLI default and are never pinned — so accepting the key and ignoring it is
+  // the worst answer available: the operator believes it took effect.
+  assert.throws(
+    () => validateConfig({ ...VALID, model: 'claude-opus-4-1' }),
+    (e) => /"model" is not supported/.test(e.message) && /CLI default/.test(e.message),
+    'a pinned model must be refused, with a message that explains why'
+  )
+  assert.throws(() => validateConfig({ ...VALID, model: null }), /"model" is not supported/, 'the key itself is the error, whatever it holds')
+  assert.doesNotThrow(() => validateConfig(VALID), 'a config without the key still validates')
+  // A neighbouring key that merely contains the word is not the pin.
+  assert.doesNotThrow(() => validateConfig({ ...VALID, tokenizerModel: 'Claude-Sonnet-4-5-20250929' }))
+})
+
 test('validateConfig requires team', () => {
   const { team, ...withoutTeam } = VALID
   assert.throws(() => validateConfig(withoutTeam), /missing required key "team"/)

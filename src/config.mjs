@@ -190,6 +190,13 @@ export function validateConfig(raw) {
       }
     }
   }
+  // Refused rather than ignored. A pinned model cannot be honoured: headless
+  // children are spawned without --model so they inherit whatever the operator
+  // saved as their own CLI default, which is the model they deliberately chose.
+  // Accepting the key and doing nothing would leave them believing otherwise.
+  if ('model' in raw) {
+    problems.push('"model" is not supported: reviews run as headless Claude children that inherit your saved Claude CLI default, and are never pinned to a model. Remove the key; change your model with /model in the CLI.')
+  }
   if (raw.depth !== undefined && raw.depth !== 'standard') {
     problems.push(raw.depth === 'deep'
       ? 'depth "deep" is not implemented in v1 — see "Depth 2 upgrade path" in the spec'
@@ -213,7 +220,6 @@ export function validateConfig(raw) {
     telemetry: raw.telemetry ?? false,
     clonesDir: raw.clonesDir || join(homedir(), '.cache', 'pr-review-bot', 'clones'),
   }
-  if (!('model' in raw)) delete config.model
   return config
 }
 

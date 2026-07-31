@@ -10,7 +10,7 @@
   },
   "slack": {
     "channel": "C0123ABC",
-    "emoji": { "inReview": "eyes", "approved": "white_check_mark", "changesRequested": "x" }
+    "emoji": { "inReview": "eyes", "approved": "white_check_mark", "changesRequested": "x", "error": "warning" }
   },
   "authorMap": { "octocat": "U0123ABC" },
   "maxPerCycle": 3,

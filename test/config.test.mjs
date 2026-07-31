@@ -71,6 +71,10 @@ test('validateConfig applies defaults without inventing a model', () => {
   assert.equal(c.slack.emoji.approved, 'white_check_mark')
   assert.equal(c.slack.emoji.changesRequested, 'x')
   assert.equal(c.slack.emoji.inReview, 'eyes')
+  // Without a default, an errored review renders `undefined` as its reaction
+  // and the Slack call fails — silently, since every Slack failure is
+  // non-blocking by design.
+  assert.equal(c.slack.emoji.error, 'warning')
   assert.deepEqual(c.authorMap, {})
   assert.ok(!('model' in c), 'model must not be defaulted')
 })

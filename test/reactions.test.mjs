@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { planReactionChange, resolveMention } from '../src/reactions.mjs'
 
-const emoji = { inReview: 'eyes', approved: 'white_check_mark', changesRequested: 'x' }
+const emoji = { inReview: 'eyes', approved: 'white_check_mark', changesRequested: 'x', error: 'warning' }
 
 test('first verdict adds and removes nothing', () => {
   assert.deepEqual(planReactionChange({ previous: null, verdict: 'changes_requested', emoji }), { remove: null, add: 'x', next: 'x' })
@@ -18,6 +18,26 @@ test('repeating the same verdict is a no-op', () => {
 
 test('in-review clears a previous verdict reaction', () => {
   assert.deepEqual(planReactionChange({ previous: 'white_check_mark', verdict: 'in_review', emoji }), { remove: 'white_check_mark', add: 'eyes', next: 'eyes' })
+})
+
+test('an errored review shows an error, not the in-review emoji it fell through to', () => {
+  // state.mjs has recorded an "error" verdict since it was written, but the
+  // ternary had no branch for it, so it landed on inReview: the PR wore 👀
+  // forever and the channel could not tell an abandoned review from a running
+  // one. The error label is sticky and never auto-retried, so nothing else was
+  // ever going to move that emoji.
+  for (const previous of [null, 'eyes', 'x', 'white_check_mark']) {
+    assert.deepEqual(
+      planReactionChange({ previous, verdict: 'error', emoji }),
+      { remove: previous && previous !== 'warning' ? previous : null, add: 'warning', next: 'warning' },
+      `from ${previous}`
+    )
+  }
+})
+
+test('repeating an error verdict is a no-op like every other verdict', () => {
+  // Slack errors on re-adding a reaction that is already there.
+  assert.deepEqual(planReactionChange({ previous: 'warning', verdict: 'error', emoji }), { remove: null, add: null, next: 'warning' })
 })
 
 test('resolveMention prefers the explicit author map', async () => {

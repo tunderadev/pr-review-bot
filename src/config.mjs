@@ -167,7 +167,7 @@ export function validateConfig(raw) {
     labels: { requested: 'review-requested', inProgress: 'review-in-progress', error: 'review-error', ...(raw.labels || {}) },
     slack: {
       ...raw.slack,
-      emoji: { inReview: 'eyes', approved: 'white_check_mark', changesRequested: 'x', ...(raw.slack.emoji || {}) },
+      emoji: { inReview: 'eyes', approved: 'white_check_mark', changesRequested: 'x', error: 'warning', ...(raw.slack.emoji || {}) },
     },
     authorMap: raw.authorMap || {},
     maxPerCycle: raw.maxPerCycle ?? 3,

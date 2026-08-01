@@ -3,8 +3,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
 import { createCheckouts } from '../src/checkout.mjs'
+import { TransientError, FatalError } from '../src/github.mjs'
 
 // Every temp tree this suite creates, removed once at the end. A clone dir holds
 // a repo plus its worktrees, so leaking one leaks a working tree per test run.
@@ -263,7 +265,100 @@ test('the default runGit actually enforces the timeout instead of stalling', asy
     .worktreeForPr({ repo: 'o/r', number: 1, sha: origin.sha, fetchRef: 'refs/heads/main' })
     .then(() => null, (e) => e)
   assert.ok(err, 'a 1ms budget must not complete a clone')
-  assert.equal(err.killed, true, `git should have been killed, got: ${err.message}`)
+  // The kill itself is now reported on the cause: worktreeForPr classifies every
+  // git failure before it leaves the module, and the wrapper is what the cycle
+  // reads. A timeout stays FATAL — a wedged git is retried forever otherwise.
+  assert.equal(err.cause?.killed, true, `git should have been killed, got: ${err.message}`)
+  assert.ok(err instanceof FatalError, `a git timeout must stay on the per-PR path, got ${err.constructor.name}`)
+})
+
+// ---------------------------------------------------------------------------
+// Git failure classification
+//
+// Every one of these is a REAL error object produced by a real execFile, not a
+// hand-built stand-in: the bug being fixed was believing git reports a string
+// errno the way undici does, and a fake error is exactly how that belief
+// survives a test suite.
+// ---------------------------------------------------------------------------
+
+const failedWorktree = (overrides) =>
+  createCheckouts({ clonesDir: tempDir('clones-'), ...overrides })
+    .worktreeForPr({ repo: 'o/r', number: 1, sha: 'a'.repeat(40), fetchRef: 'refs/heads/main' })
+    .then(() => null, (e) => e)
+
+test('a git transport failure is transient — the network, not this PR', async () => {
+  // Resolution of an .invalid host fails offline and fails identically to the
+  // laptop case this tool is built for: a sleep/wake or a dropped wifi link.
+  const err = await failedWorktree({ remoteUrlFor: () => 'https://nonexistent-host-xyz.invalid/o/r.git' })
+  assert.ok(err, 'an unresolvable host must not succeed')
+  assert.ok(
+    err instanceof TransientError,
+    `a DNS failure must be retried, not benched with the sticky label. Got ${err.constructor.name}: ${err.message}`
+  )
+  assert.match(err.message, /resolve host/i, 'the operator has to be able to see what git said')
+  assert.equal(err.cause?.code, 128, 'git reports a NUMERIC exit code, which is the whole bug')
+})
+
+test('a repository error is not a transport failure and stays per-PR', async () => {
+  const err = await failedWorktree({ remoteUrlFor: () => join(tempDir('gone-'), 'no-such-repo') })
+  assert.ok(err)
+  assert.ok(
+    err instanceof FatalError,
+    `a missing repository is deterministic and must reach a human. Got ${err.constructor.name}: ${err.message}`
+  )
+  assert.equal(err instanceof TransientError, false)
+})
+
+test('a missing git binary reaches a human instead of retrying forever', async () => {
+  const execFileAsync = promisify(execFile)
+  const err = await failedWorktree({
+    remoteUrlFor: () => 'https://github.com/o/r.git',
+    // A real spawn of a binary that is not there: code is the STRING 'ENOENT',
+    // which is precisely the shape the transport allow-list was built around.
+    runGit: async (args, cwd, { env = {}, timeoutMs } = {}) =>
+      (await execFileAsync('git-not-installed-pr-review-bot', args, { cwd, env: { ...process.env, ...env }, timeout: timeoutMs })).stdout,
+  })
+  assert.ok(err)
+  assert.equal(err.cause?.code, 'ENOENT', 'the fixture must reproduce a real spawn failure')
+  assert.ok(
+    err instanceof FatalError,
+    `no amount of retrying installs git. Got ${err.constructor.name}: ${err.message}`
+  )
+  // "could not be run", not "failed": git never started, so nothing it might
+  // have said about the remote is in play, and the human is being told to
+  // install something rather than to go looking at the network.
+  assert.match(err.message, /could not be run \(ENOENT\)/, err.message)
+})
+
+test('a git killed by our own budget stays fatal even when it printed transport prose first', async () => {
+  const execFileAsync = promisify(execFile)
+  const err = await failedWorktree({
+    remoteUrlFor: () => 'https://github.com/o/r.git',
+    gitTimeoutMs: 150,
+    // A real execFile kill, with real stderr captured before the signal: git
+    // retrying a stalled connection says "Connection timed out" and then hangs.
+    // Read off the text alone that is a transport failure and the wedged call is
+    // retried every cycle forever; the kill is what says otherwise.
+    runGit: async (args, cwd, { timeoutMs } = {}) =>
+      (
+        await execFileAsync('sh', ['-c', 'echo "fatal: unable to access: Connection timed out" >&2; sleep 30'], {
+          timeout: timeoutMs,
+        })
+      ).stdout,
+  })
+  assert.ok(err)
+  assert.equal(err.cause?.killed, true, 'the fixture must reproduce a real kill')
+  assert.match(String(err.cause?.stderr), /Connection timed out/, 'and it must carry the transport-shaped stderr')
+  assert.ok(err instanceof FatalError, `a wedged git must reach a human, got ${err.constructor.name}: ${err.message}`)
+})
+
+test('the classified failure names the git subcommand and never the credential', async () => {
+  const err = await failedWorktree({
+    remoteUrlFor: () => 'https://x-access-token:ghs_SECRETTOKENVALUE0000000000000000@nonexistent-host-xyz.invalid/o/r.git',
+  })
+  assert.ok(err instanceof TransientError, err?.message)
+  assert.match(err.message, /git clone/, 'which git call failed is the first thing a human asks')
+  assert.equal(err.message.includes('ghs_SECRETTOKENVALUE0000000000000000'), false, 'the credential must never reach a log line')
 })
 
 // A killed review never runs cleanup(). Its worktree directory, its registration

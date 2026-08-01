@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { TransientError, FatalError } from './github.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -20,6 +21,68 @@ const NON_INTERACTIVE_ENV = {
   SSH_ASKPASS: '',
   SSH_ASKPASS_REQUIRE: 'never',
   GIT_SSH_COMMAND: 'ssh -oBatchMode=yes',
+}
+
+// ---------------------------------------------------------------------------
+// Failure classification
+//
+// This module fetches from github.com for every PR on every cycle, so it is the
+// most network-exposed step in the pipeline — and the only one that talks to
+// the network through a child process rather than through fetch. That changes
+// the shape of the failure completely: undici hands back a STRING errno
+// ('ENOTFOUND', 'ECONNRESET'), while git hands back an exit STATUS. Every
+// remote failure git has — a DNS outage, a deleted repository, a bad
+// credential — exits 128, so the number says nothing and the caller's
+// errno-based test never fires. Classified by that test alone, a dropped wifi
+// link earns the sticky review-error label that no automation ever clears, on
+// every PR in the queue, from one blip.
+//
+// So the classification happens HERE, where git's own stderr is still in hand,
+// and leaves in the vocabulary the cycle already speaks: TransientError is
+// retried next cycle, anything else is benched for a human.
+// ---------------------------------------------------------------------------
+
+// Taken from real failures, not guessed: these are what git and libcurl print
+// when the bytes never made it. Deliberately narrow — the cost of reading a
+// deterministic fault as transient is a PR retried every cycle forever with no
+// signal, so anything not recognisably a transport failure stays fatal.
+const GIT_TRANSPORT_STDERR = [
+  /could not resolve host|could not resolve hostname|temporary failure in name resolution|name or service not known|nodename nor servname/i,
+  /failed to connect|couldn't connect to server|connection refused|connection reset|connection timed out|connection closed by remote host|network is unreachable|no route to host|operation timed out/i,
+  /the remote end hung up unexpectedly|early eof|rpc failed|unexpected disconnect|transfer closed|empty reply from server|recv failure|send failure/i,
+  /gnutls_handshake|ssl connect error|ssl_error|schannel: failed/i,
+  // git surfaces an HTTP status only for the codes libcurl refuses to follow.
+  // 403 and 404 are deliberately absent: those are a bad credential or a repo
+  // that is not there, and both need a human rather than another attempt.
+  /the requested url returned error: (?:408|429|5\d\d)/i,
+]
+
+// Exported for direct testing, and because "which failures are transient" is
+// the single most consequential rule in this file.
+export function classifyGitFailure(error, args = []) {
+  const what = args[0] ? `git ${args[0]}` : 'git'
+  // stderr first: execFile's own message is the stderr with the whole command
+  // line — including the remote URL — glued in front of it. Truncated, because
+  // git can print a repository's own content back at you.
+  const detail = String(error?.stderr || error?.message || error).replace(/\s+/g, ' ').trim().slice(0, 300)
+
+  // Killed by our own wall-clock budget: `killed` is set and there is no exit
+  // status at all. Deliberately fatal — a wedged git retried every cycle is the
+  // same unattended loop a hung review is, and it stops nowhere.
+  if (error?.killed || error?.signal) {
+    return new FatalError(`${what} exceeded its time budget and was killed: ${detail || '(no output)'}`, { cause: error })
+  }
+  // A STRING code is a spawn failure — git never ran. The only one that matters
+  // is ENOENT, git not installed, and no number of retries installs it.
+  if (typeof error?.code === 'string') {
+    return new FatalError(`${what} could not be run (${error.code}): ${detail || '(no output)'}`, { cause: error })
+  }
+  if (GIT_TRANSPORT_STDERR.some((re) => re.test(detail))) {
+    return new TransientError(`${what} could not reach the remote: ${detail}`, { cause: error })
+  }
+  // Everything else git can fail at is deterministic from here: a repository
+  // that is not there, a ref that does not exist, a credential that is refused.
+  return new FatalError(`${what} failed: ${detail || '(no output)'}`, { cause: error })
 }
 
 // Credentials travel per invocation, in the environment. Not in argv, which any
@@ -176,7 +239,16 @@ export function createCheckouts({
       const remote = splitCredential(remoteUrlFor(repo))
       const credential = credentialFor(repo) || remote.credential
       const env = { ...NON_INTERACTIVE_ENV, ...credentialEnv(credential) }
-      const git = (args, cwd) => runGit(args, cwd, { env, timeoutMs: gitTimeoutMs })
+      // Every git call in this module goes through here, so no future call site
+      // can hand an unclassified execFile error to a caller that reads it as a
+      // permanent fault.
+      const git = async (args, cwd) => {
+        try {
+          return await runGit(args, cwd, { env, timeoutMs: gitTimeoutMs })
+        } catch (error) {
+          throw classifyGitFailure(error, args)
+        }
+      }
 
       const cloneDir = await ensureClone(repo, remote.url, git)
       // Fetched by explicit URL rather than through the stored remote, so the

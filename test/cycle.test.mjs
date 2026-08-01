@@ -1,6 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runCycle, REVIEW_FALLBACK_NOTE } from '../src/cycle.mjs'
+import { createCheckouts } from '../src/checkout.mjs'
 import { renderStateComment, emptyState, appendRound, parseState } from '../src/state.mjs'
 import { TransientError, FatalError } from '../src/github.mjs'
 import { ReviewTimeoutError, ReviewRunError } from '../src/review.mjs'
@@ -267,6 +271,35 @@ test('transient failure restores review-requested, aborts cycle, sets no error l
   assert.equal(named(actions, 'add-label', 'review-error').length, 0)
   assert.ok(named(actions, 'remove-label', 'review-in-progress').length === 1)
   assert.equal(named(actions, 'react-add', 'warning').length, 0, 'still in review — it will be retried')
+})
+
+// The real createCheckouts, driving a real git, at a host that cannot resolve —
+// the laptop case this tool is deployed on: a sleep/wake, a dropped link, a
+// flaky DNS server. Stubbing the checkout would only prove what the stub was
+// told to throw, and the bug was in what git actually throws.
+test('a git transport failure defers the PR and aborts the cycle, benching nobody', async () => {
+  const clonesDir = mkdtempSync(join(tmpdir(), 'cycle-clones-'))
+  const checkouts = createCheckouts({ clonesDir, remoteUrlFor: () => 'https://nonexistent-host-xyz.invalid/o/r.git' })
+  const { deps, actions } = makeDeps({
+    github: {
+      listOpenPrs: async () => [
+        rawPr({ number: 7 }),
+        rawPr({ number: 8, updated_at: '2026-07-29T19:00:00Z' }),
+        rawPr({ number: 9, updated_at: '2026-07-29T20:00:00Z' }),
+      ],
+    },
+    worktreeForPr: (a) => checkouts.worktreeForPr(a),
+  })
+  try {
+    const out = await runCycle({ config, deps, now: NOW })
+    assert.equal(named(actions, 'add-label', 'review-error').length, 0, 'a network blip must not bench a healthy PR forever')
+    assert.equal(named(actions, 'add-label', 'review-requested').length, 1, 'the deferred PR keeps its trigger label')
+    assert.equal(out.aborted, true, 'one outage must not be walked into three times')
+    assert.deepEqual(out.processed.map((p) => p.number), [7], 'the rest of the queue is left untouched')
+    assert.equal(named(actions, 'review').length, 0)
+  } finally {
+    rmSync(clonesDir, { recursive: true, force: true })
+  }
 })
 
 test('a transient failure keeps the Slack ts it just minted', async () => {

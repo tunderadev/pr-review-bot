@@ -42,8 +42,11 @@ a label, a verdict mapping or an API call.
 
 **Headless Claude** does only the judgment. A `claude -p` child reads a real checkout of the PR head
 with `Read`, `Grep` and `Glob` and returns a strict JSON verdict. A second child then tries to
-*refute* each blocking finding; a claim survives only if a concrete path to the stated failure can
-be traced. Surviving blockers map to `REQUEST_CHANGES`, none to `APPROVE`.
+*refute* each blocking finding — the first fifteen of them, and nits never — a claim surviving only
+if a concrete path to the stated failure can be traced. Surviving blockers map to
+`REQUEST_CHANGES`, none to `APPROVE`. Anything the refutation could not judge, including findings
+past that cap, is named in the review's *Not verified* section and blocks nobody; see
+[section 6](#6-writing-good-review-criteria).
 
 **All state lives in GitHub.** There is no local database. Two facts carry everything: the bot's own
 past reviews (used for a head-SHA check — an unchanged head is never re-reviewed, and costs zero
@@ -371,8 +374,8 @@ try-before-you-install path, and the fastest way to check an edit to the command
 
 If you followed an earlier version of this README and symlinked the clone into `~/.claude/skills/`,
 remove the symlink before installing. That directory auto-loads whatever it contains as a plugin, so
-leaving it means the same plugin is loaded twice from two places — and it was never the way to get
-`/pr-watch` either, since the command was namespaced there too.
+leaving it means the same plugin is loaded twice from two places — and it never produced a bare
+`/pr-watch` either, since the command is namespaced under the plugin however it is loaded.
 
 ### 10. Go live
 
@@ -455,6 +458,41 @@ is told to refute when uncertain.** A vague blocking rule does not produce a bad
 A finding is exactly four fields: `file`, `line`, `claim`, `why`. A rule that cannot be violated at
 a specific line, with a specific consequence, cannot produce a finding at all.
 
+### Verification stops at fifteen blocking findings
+
+The refutation pass is the only unbounded fan-out in the pipeline — one `claude` child per blocking
+finding, run one after another, each allowed five minutes and each retried once — so it is capped at
+the **first fifteen blocking findings** a review raises. Nits are never verified and do not count
+against the cap.
+
+Findings past the cap are never examined, and the cap is deliberately not silent about it. They are
+recorded as **unverified**, which has three consequences:
+
+- They **never block the author.** Nothing checked them, and uncertainty must not cost somebody a
+  round trip on a claim that may well be wrong.
+- They **cannot be silently approved over either.** An unverified finding makes the whole pass
+  *degraded*, and a degraded pass with no surviving blockers posts no verdict at all — the PR is
+  re-queued instead. So "we ran out of budget" can never turn into a green check.
+- They are **named in the review body**, in a section that exists only when something genuinely went
+  unchecked:
+
+  > ### Not verified (5)
+  >
+  > These were raised by the review and then dropped **without being judged** — the verification
+  > pass could not reach a verdict on them. They are **not blocking** and may well be wrong; they are
+  > listed because a review that could not check them is weaker than one that did.
+  >
+  > - **src/api/orders.ts:88** — … _(not verified: this review raised 20 blocking findings and only the first 15 are verified)_
+
+That same section is where a timed-out or errored refutation lands, so hitting the cap looks to a
+reader exactly like what it is: findings nobody checked.
+
+**Treat the cap as a signal about your criteria.** A review claiming more than fifteen blocking
+defects is not an actionable review — nobody works through a list that long — so reaching the cap
+means a rule is firing far too widely. It is the most practical reason to keep **Always blocking**
+short and specific: a review that raises twenty blockers does not review harder, it reviews *less*,
+and it may post nothing at all.
+
 ### Worked example
 
 **Vague rule:**
@@ -535,10 +573,32 @@ different hash means you did.
 |---|---|---|
 | `review-requested` | The author is asking for a review. **The only trigger.** | Author adds it. The bot removes it when it claims the PR, and restores it on a transient failure. |
 | `review-in-progress` | A cycle has claimed this PR. Transient — it should exist for minutes, not hours. | Bot only. If it sticks, a cycle was killed mid-review; remove it by hand. |
-| `review-error` | A per-PR failure. **Sticky — never retried automatically.** | Bot adds it. **Only a human removes it.** |
+| `review-error` | A per-PR failure. **Sticky — never retried automatically, and an outright exclusion from selection.** | Bot adds it. **Only a human removes it.** |
 
 Names are configurable under `labels`; `doctor` creates whatever you configured in each allowlisted
 repo if it is missing.
+
+**`review-error` excludes a PR from selection.** A PR wearing it is not picked up, not re-attempted
+and not re-reviewed — it is stepped over before any work happens, so it costs nothing at all. That
+exclusion is exactly what makes the recovery below work: clear `review-error`, re-add
+`review-requested`, and the next cycle treats the PR as an ordinary request. Without it the bot
+would fail on the PR again, re-apply the label every cycle forever, and hand it straight back to
+whoever had just cleared it.
+
+A PR that wears *both* labels is somebody asking for a re-review that is never coming, so every
+cycle says so out loud and names it:
+
+```
+acme/api: 1 PR(s) carry the review-error label and were skipped — #12. That label is never cleared
+automatically: fix what failed, remove it, then re-add review-requested.
+```
+
+**The bot never leaves both labels on.** They are opposite instructions — `review-requested` means
+try again next cycle, `review-error` means stop and fetch a human — so a run that ends in a per-PR
+failure removes the trigger label as it applies the sticky one. A failure that happened *before* the
+PR was claimed used to leave both: selection saw `review-requested`, failed in exactly the same way,
+and re-applied `review-error`, every cycle, forever. Only a human can put the two together now, and
+the log line above is what tells you one did.
 
 ### Requesting a re-review
 
@@ -562,16 +622,52 @@ off as the new one goes on, so a PR that went ❌ then ✅ never wears both.
 ### Clearing `review-error`
 
 Nothing will ever clear it for you, and that is the point — a PR that failed once would otherwise
-fail every five minutes forever, on your quota, with nobody watching.
+fail every five minutes forever, on your quota, with nobody watching. While the label is on, the PR
+is excluded from selection entirely, so nothing at all happens to it until you do this:
 
 1. Read the cycle log line: `owner/repo#12 failed: <reason>`.
-2. Fix the cause (it is usually configuration, a wedged review, or a PR the diff budget cannot cope
-   with).
+2. Fix the cause (it is usually configuration, a wedged review, a PR the diff budget cannot cope
+   with, or the repeated-verification failure described next).
 3. Remove `review-error`.
 4. Add `review-requested` to re-queue it.
 
+Do it in that order. Adding `review-requested` first only produces the "carry the review-error label
+and were skipped" line above, because the exclusion wins until the sticky label is gone.
+
 A stuck `review-in-progress` is different: it means a cycle was killed mid-review, not that anything
 is wrong with the PR. Remove it by hand and re-add `review-requested`.
+
+### When the bot cannot verify a PR at all
+
+Every blocking finding is checked by a second pass that tries to refute it. Sometimes that pass
+cannot reach a verdict on *anything* — `claude` is broken on this machine, a gateway is erroring on
+every call, the subscription is walled. Zero surviving blockers then reads exactly like a clean
+review, so the cycle refuses to post a verdict at all and re-queues the PR instead (exit `3`).
+
+That is the right answer for a condition that clears itself and the wrong one for a condition that
+does not, and a single occurrence cannot tell them apart. So the attempts are counted in the ledger,
+per head SHA. **On the third consecutive attempt at the same commit where nothing could be verified,
+the PR gets `review-error` instead of being re-queued**, and the failure line says so:
+
+```
+acme/api#12 failed: refutation could not verify 2 blocking finding(s) on acme/api#12 and none
+survived, so the correct verdict is unknown; nothing posted. That is 3 consecutive attempts at
+abc1234, so the cause is not clearing itself — check that `claude` runs from the command line and
+that reviews are not hitting a wall. The PR is benched until a human clears the label.
+```
+
+**Read that as a statement about the bot, not about the pull request.** It is not saying your PR is
+bad, and it is not withholding findings it will not name. It is saying it could not get a
+trustworthy answer about the PR three times running, and would rather stop than keep spending your
+quota guessing. Nothing was posted, so there is no verdict to argue with — the thing to fix is the
+reviewer, not the code.
+
+Two details worth knowing:
+
+- **The count is keyed to the head SHA.** Pushing a new commit starts a fresh set of attempts. New
+  code deserves them, and a push is also the likeliest thing to change the outcome.
+- **The count survives the escalation.** Clearing the label without fixing the cause costs one more
+  cycle to discover that, not another three. Reaching a real verdict is what resets it.
 
 ### Upgrades
 
@@ -650,9 +746,10 @@ treat unparseable stdout with exit `0` as "nothing measured yet" rather than as 
 me" is answerable even from a broken installation.
 
 What drives the bill: one review call per PR (two if the first response was not valid JSON), plus
-one verification call per **blocking** finding (two if its first answer was unparseable). Nits are
-never verified. Criteria that generate many blockers cost proportionally more whether or not those
-blockers survive.
+one verification call per **blocking** finding (two if its first answer was unparseable), for the
+first fifteen blocking findings of a review. Nits are never verified. Criteria that generate many
+blockers cost proportionally more whether or not those blockers survive — up to that cap, past
+which they stop costing money and start costing the verdict, since the round posts nothing at all.
 
 ### One runner per team
 
@@ -764,13 +861,61 @@ The loop and any cron wrapper branch on these, so each means exactly one thing.
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | Cycle completed | Nothing |
-| 1 | Configuration or usage error — nothing ran | Read the message; it names what to fix. Then `doctor` |
+| 1 | Configuration, usage, or repo-discovery error — nothing was reviewed | Read the message; it names what to fix. Then `doctor` |
 | 2 | `doctor` found red checks | Fix them. Only `doctor` returns this |
-| 3 | Transient abort | **Nothing.** The PR is back under `review-requested` and retries next cycle |
+| 3 | Transient abort | **Nothing.** The affected PR is back under `review-requested` and retries next cycle |
 | 4 | At least one PR failed | It wears `review-error` and is never auto-retried. A human must look |
 | 5 | A bug in this tool | Re-run with `PR_REVIEW_DEBUG=1` for the stack trace |
 
-3 and 4 are the pair that matters: 3 clears itself, 4 never does.
+3 and 4 are the pair that matters: 3 clears itself, 4 never does. And **an aborted cycle wins over a
+per-PR failure**: if one PR earned `review-error` and a later one hit a transient condition, the
+cycle exits `3`, because the abort is what stopped the run. Read the per-PR lines to see whether any
+PR was left wearing the sticky label.
+
+What lands in each code:
+
+**`0` — nothing needs a human.** A cycle that found no labelled PRs; a review posted normally; a PR
+skipped because its head SHA was already reviewed; a PR stepped over because it wears
+`review-error`; and a PR whose author's GitHub account has been deleted — that last one is reviewed
+exactly like any other, and only the Slack mention degrades to unlinked text.
+
+**`1` — the operator has to change something, and nothing was reviewed.** Every configuration and
+usage cause (bad arguments, a missing environment variable, no `team.json`, an unreadable private
+key, an invalid config), **plus every deterministic failure to list a repo's pull requests**:
+
+| Discovery failure | Usual cause |
+|---|---|
+| `404` | The repo is misspelled in `repos`, or the App is not installed on it |
+| `403` that is not a rate limit | The App is installed but lacks pull-request read on that repo |
+| `401` | The credentials are not valid for this installation |
+| A `200` carrying something that is not a list | A proxy or a redirect answered instead of the API |
+| A `Link` header with an unparseable `rel="next"` | Not GitHub's own pagination — something is rewriting responses |
+| Still paginating after 10 pages | The same; the list is refused rather than silently truncated |
+
+Each is raised as a `DiscoveryError` that names the repo and what to change. **These used to exit
+`5`**, which told the operator it was a bug in this tool and not to attempt a fix — for something as
+ordinary as a typo in `repos`.
+
+**`2` — `doctor` ran and found red checks.** The command worked; the setup did not. Only `doctor`
+returns this.
+
+**`3` — a transient abort, and there is nothing to do.** During discovery — a `429`, any `5xx`, a
+`403` that *is* a rate limit, or a retryable network errno — nothing has been claimed yet, so no PR
+is processed and **no label is touched at all**; the next cycle simply asks again. During a PR: a
+Claude usage limit, a transient GitHub failure, a **git transport failure** (DNS, a refused or reset
+connection, a `408`/`429`/`5xx` from the remote), or a verification pass that came back degraded
+with no survivors while still under the escalation threshold described above. The PR keeps
+`review-requested` either way.
+
+**`4` — the cycle finished, and at least one PR now wears the sticky `review-error`.** A review that
+timed out; a `claude` run the CLI itself reported as failed; a verdict that would not parse even
+after a retry; a GitHub `422` on the review POST; a **git repository error** (a repo that is not
+there, a ref that does not exist, a credential refused); a **missing `git` binary**; **git killed by
+its own five-minute time budget**; and the **third consecutive degraded-with-no-survivors attempt at
+the same head SHA**.
+
+**`5` — a genuine bug in this tool, and nothing else.** Not a misconfiguration, not a network
+condition, and no longer a mistyped repo name. Re-run with `PR_REVIEW_DEBUG=1` for the stack trace.
 
 ## 8. Troubleshooting
 
@@ -789,8 +934,11 @@ The loop and any cron wrapper branch on these, so each means exactly one thing.
 | A private repo fails to clone or fetch | The App needs `Contents: read` **and** must be installed on that repo. git runs with `GIT_TERMINAL_PROMPT=0` and cannot ask for a password, so a missing credential is a hard failure, not a prompt |
 | Reviews cost far more than expected | Run `report`. Then trim the criteria (fewer, sharper blocking rules — each blocker costs a verification call whether or not it survives) or lower `maxDiffLines` |
 | Every PR fails identically | Almost always `claude` not being on the `PATH` the bot actually runs under — a launchd/cron `PATH` is not your interactive shell's. `doctor`'s `claude cli` check settles it |
-| `review-error` keeps coming back after you clear it | The PR genuinely keeps failing. Read the `owner/repo#N failed: …` line from the cycle log before re-queueing it again; re-adding the label without changing anything just buys the same failure |
+| `review-error` keeps coming back after you clear it | The PR genuinely keeps failing — the label is no longer re-applied to a PR that was merely skipped. Read the `owner/repo#N failed: …` line from the cycle log before re-queueing it again; re-adding the trigger label without changing anything just buys the same failure |
+| `N PR(s) carry the review-error label and were skipped` every cycle | Someone added `review-requested` to a PR that still wears `review-error`. The sticky label wins, and the PR is stepped over untouched. Remove `review-error` **first**, then re-add `review-requested` |
 | Exit 3 with `refutation could not verify … and none survived` | Deliberate. Verification could not reach a verdict on any blocker, so the correct verdict is unknown; nothing is posted and the PR is re-queued. An approval built on findings nobody checked is the worst thing this tool can do |
+| The same message, but exit 4 and `That is 3 consecutive attempts at <sha>` | The escalation. Three attempts at one head SHA all failed to verify anything, so the cause is not clearing itself and the PR is benched for a human. It says nothing about the PR's quality — fix the reviewer (usually `claude` on the bot's `PATH`, or a walled subscription), then clear the label. See *When the bot cannot verify a PR at all* in [section 7](#7-day-2-operations) |
+| A review body ends with a `Not verified` section | Findings the verification pass could not judge — it timed out, errored, or the review raised more than the fifteen blocking findings that get verified. They are not blocking, and they are listed rather than dropped so the review's weaker parts are visible. Many of them means a criteria rule is firing too widely |
 | Reviews suddenly cost money on the API instead of the subscription | One of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` is set in the shell that starts the loop. `doctor`'s `claude auth mode` check names the offender and prints the `unset` line |
 | `"model" is not supported…` at startup | Remove the key. Headless children inherit your saved Claude CLI default by design; change it with `/model` |
 

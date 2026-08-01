@@ -70,7 +70,11 @@ oldest-updated first *across* repos, then capped at `maxPerCycle` (default 3). T
 6. **Review.** A `claude -p` child runs with `Read Grep Glob` in a detached worktree checked out at
    the PR head, against the criteria, the diff, and last round's unresolved blockers.
 7. **Verify.** A second child tries to refute each *blocking* finding. Nits are never checked.
-   Survivors only.
+   Survivors only. **Capped at the first 15 blocking findings** — findings past the cap are never
+   examined at all: they are recorded as *unverified*, so they never block the author, they are
+   named in the review body's **Not verified** section, and they make the pass *degraded*, which
+   means no verdict is posted (see the guard below). Reaching the cap is a signal that a criteria
+   rule is firing far too widely.
 8. **Verdict.** Surviving blockers → `REQUEST_CHANGES`; none → `APPROVE`, posted as the App.
 9. Reconcile the Slack reaction; on changes requested, thread-reply tagging the author with the
    surviving blockers.
@@ -84,13 +88,39 @@ survived, the correct verdict is unknown, so nothing is posted at all and the PR
 the cycle exits 3. That is deliberate: an approval built on findings nobody checked is the worst
 thing this tool can do.
 
+**And its escalation.** Re-queuing is right for a condition that clears itself and wrong for one
+that does not, and a single occurrence cannot tell them apart. So the attempts are counted in the
+ledger, keyed to the head SHA: on the **third consecutive attempt at the same commit** where
+nothing could be verified, the PR gets the sticky `review-error` label instead of being re-queued,
+and the cycle exits 4. Read that as a statement about the bot, not about the PR — it could not get
+a trustworthy answer three times running and stopped rather than keep spending quota guessing.
+Nothing was posted, so there is no verdict to argue with; the thing to fix is usually `claude` on
+the bot's `PATH` or a walled subscription. Pushing a new commit starts a fresh set of attempts; the
+count survives the escalation, so clearing the label without fixing the cause costs one more cycle
+to discover that, not another three.
+
 ## The three labels
 
 | Label | Meaning |
 |---|---|
 | `review-requested` | The author is asking for a review. The only trigger. Re-add it after pushing fixes. |
 | `review-in-progress` | A cycle has claimed this PR. Transient. If it sticks, a cycle was killed mid-review. |
-| `review-error` | A per-PR failure. **Never retried automatically.** Investigate, remove it, then re-add `review-requested`. |
+| `review-error` | A per-PR failure. **Sticky — never retried automatically, and an outright exclusion from selection.** Only a human removes it. |
+
+**`review-error` is an exclusion, not a retry.** A PR wearing it is stepped over before any work
+happens — not picked up, not re-attempted, not re-reviewed, costing nothing at all. That exclusion
+is exactly what makes the recovery work: fix the cause, remove `review-error`, **then** re-add
+`review-requested`, in that order. Without it the bot would fail on the PR again and re-apply the
+label every cycle forever, handing it straight back to whoever had just cleared it.
+
+The two labels can no longer coexist by the bot's own doing: a run that ends in a per-PR failure
+removes the trigger label as it applies the sticky one. Only a human can put the two together — by
+re-adding `review-requested` to a PR that still wears `review-error` — and that is a re-review that
+is never coming, so every cycle says so and names the PR:
+
+```
+acme/api: 1 PR(s) carry the review-error label and were skipped — #12. That label is never cleared automatically: fix what failed, remove it, then re-add review-requested.
+```
 
 Names are configurable under `labels` in `team.json`; `doctor` creates them in each allowlisted
 repo if they are missing. Slack reactions are configurable too, under `slack.emoji` — the keys are
@@ -111,6 +141,10 @@ The short version:
   nothing.
 - A finding is `file`, `line`, `claim`, `why`. A rule that cannot name a locatable consequence
   cannot produce a finding.
+- **Only the first 15 blocking findings are verified.** The rest are recorded as unverified, which
+  means they never block *and* cannot be approved over — the pass goes degraded and posts no
+  verdict. So a rule that fires widely does not review harder, it reviews *less*. Keep **Always
+  blocking** short and specific.
 - The tuning loop is **edit criteria → `cycle --dry-run --limit 1 --config <dir>` against a labeled
   PR → read the rendered review → adjust → repeat.** A dry run performs the whole review — fetch,
   checkout, model call, refutation pass, rendering — and prints the review body it would have
@@ -153,21 +187,44 @@ no longer comparable. It prints the summary *first* and then deletes the log, so
 accumulates on disk and you cannot lose the figure you were about to read.
 
 What drives the bill: one review call per PR (two if the first response was not valid JSON), plus
-one verification call per blocking finding (two if its first answer was unparseable). Criteria that
-generate many blockers cost proportionally more, whether or not those blockers survive.
+one verification call per blocking finding (two if its first answer was unparseable), for the first
+15 blocking findings only. Criteria that generate many blockers cost proportionally more, whether or
+not those blockers survive — up to that cap, past which they stop costing money and start costing
+the verdict.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Cycle completed. |
-| 1 | Configuration or usage error — nothing ran. The message names what to fix. |
+| 0 | Cycle completed. A same-SHA skip, a PR stepped over for wearing `review-error`, and a PR whose author account was deleted all land here. |
+| 1 | Configuration, usage, **or repo-discovery** error — nothing was reviewed. The message names what to fix. |
 | 2 | `doctor` found red checks. The command worked; the setup did not. Only `doctor` returns this. |
-| 3 | Transient abort. The PR is back under `review-requested` and retries next cycle. Do nothing. |
+| 3 | Transient abort. The affected PR is back under `review-requested` and retries next cycle. Do nothing. |
 | 4 | At least one PR failed and now wears `review-error`. Never auto-retried; a human must look. |
 | 5 | A bug in this tool. Re-run with `PR_REVIEW_DEBUG=1` for the stack trace. |
 
-3 and 4 are the pair that matters: 3 clears itself, 4 never does.
+3 and 4 are the pair that matters: 3 clears itself, 4 never does. And **an aborted cycle wins over
+a per-PR failure**: if one PR earned `review-error` and a later one hit a transient condition, the
+cycle exits `3`. Read the per-PR lines rather than trusting the code alone.
+
+What lands in each:
+
+- **`1`** — bad arguments, a missing environment variable, no `team.json`, an unreadable private
+  key, an invalid config; **plus every deterministic failure to list a repo's pull requests**: a
+  `404` (the repo is misspelled in `repos`, or the App is not installed on it), a plain `403`, a
+  `401`, a `200` carrying something that is not a list, an unparseable `rel="next"` in the `Link`
+  header, or still paginating after 10 pages. Each is raised as a `DiscoveryError` naming the repo.
+  **These used to exit `5`**, which told the operator not to attempt a fix for a typo in `repos`.
+- **`3`** — during discovery: a `429`, any `5xx`, a `403` that *is* a rate limit, or a retryable
+  network errno. Nothing has been claimed, so **no label is touched at all**. During a PR: a Claude
+  usage limit, a transient GitHub failure, a **git transport failure**, or a degraded verification
+  pass with no survivors while still under the escalation threshold. The PR keeps `review-requested`.
+- **`4`** — a review that timed out; a `claude` run the CLI itself reported as failed; a verdict
+  that would not parse even after a retry; a GitHub `422` on the review POST; a **git repository
+  error**; a **missing `git` binary**; **git killed by its own time budget**; and the **third
+  consecutive degraded-with-no-survivors attempt at the same head SHA**.
+- **`5`** — a genuine bug in this tool, and nothing else. Not a misconfiguration, not a network
+  condition, and no longer a mistyped repo name.
 
 ## Limits
 
@@ -183,10 +240,10 @@ README's day-2 section.
   count counts completed reviews, not attempts.
 - **A cycle has no wall-clock bound.** Reviews and refutations are serial: 20 min per review call
   (up to 2), 5 min per refutation call (up to 2 per blocking finding, first 15 findings only), 5 min
-  per git invocation, all multiplied by `maxPerCycle`. A cycle can easily outlast a 5-minute poll,
-  so a runner that starts
-  ticks on a fixed interval can overlap *itself* — the same double-review the "one runner per team"
-  rule exists to prevent. Lower `maxPerCycle`, or serialise ticks.
+  per git invocation, all multiplied by `maxPerCycle` — a single PR at the cap can run close to
+  three hours. A cycle can easily outlast a 5-minute poll, so a runner that starts ticks on a fixed
+  interval can overlap *itself* — the same double-review the "one runner per team" rule exists to
+  prevent. Lower `maxPerCycle`, or serialise ticks.
 - **The operator's own hooks run against PR code.** The PR's tree is stripped of `.claude/`,
   `.mcp.json`, `CLAUDE.md` and friends, so the PR cannot execute anything. But the child inherits
   `HOME` and its working directory is the PR checkout, so hooks in `~/.claude/settings.json` fire
@@ -203,6 +260,13 @@ README's day-2 section.
   for).
 - **A review body appears as a plain comment headed with a warning** — GitHub rejected the formal
   review, so the text was preserved rather than lost. The PR wears `review-error`.
+- **A review body ends with a `Not verified` section** — findings the verification pass could not
+  judge: it timed out, it errored, or the review raised more than the 15 blocking findings that get
+  verified. They are not blocking, and they are listed rather than dropped so the review's weaker
+  parts are visible. Many of them means a criteria rule is firing too widely.
+- **`N PR(s) carry the review-error label and were skipped` every cycle** — someone added
+  `review-requested` to a PR that still wears `review-error`. The exclusion wins. Remove
+  `review-error` **first**, then re-add `review-requested`.
 - **Slack is silent but reviews land** — expected under failure. Slack is a mirror, never a gate;
   every Slack call is best-effort and logs `Slack … failed for owner/repo#N`.
 - **Mentions are plain text, not pings** — the author is missing from `authorMap` in `team.json`.

@@ -23,9 +23,20 @@ be written:
 4. **The reviewer works in a real checkout of the PR head** and can Read, Grep and Glob the whole
    tree, not just the diff. Rules may require a claim to be confirmed against callers, guards or
    tests that the diff does not show — and should, when that is what makes the claim provable.
+5. **Only the first 15 blocking findings of a review are verified.** Blocking findings past that cap
+   are never examined at all. They are recorded as *unverified*, which cuts both ways on purpose:
+   they never block the author, and they cannot be approved over either — an unverified finding
+   makes the whole pass *degraded*, and a degraded pass with no surviving blockers posts **no
+   verdict at all** and re-queues the PR. Nits are never verified and do not count against the cap.
 
 Fact 2 is the one that costs you. A vague blocking rule does not produce a bad review; it produces
 *nothing*, after paying for a review call plus one verification call per claim it invented.
+
+Fact 5 is the one that argues for keeping this file tight. A review claiming more than fifteen
+blocking defects is not an actionable review — nobody works through a list that long — so reaching
+the cap means a rule here is firing far too widely. It is the most practical reason to keep
+**Always blocking** short and specific: a rule that raises twenty blockers does not review harder,
+it reviews *less*, and the round may post nothing at all.
 
 ## The bar for "blocking"
 
@@ -94,7 +105,9 @@ Replace these with yours. Keep the shape — trigger, then the evidence the find
 
 - These criteria are authoritative. Do not raise your own preferences as blocking findings.
 - One well-evidenced blocking finding beats five speculative ones. There is no credit for volume,
-  and each extra blocker costs a verification call that will refute it anyway.
+  and each extra blocker costs a verification call that will refute it anyway. Past fifteen blocking
+  findings there is not even a verification call: the surplus is recorded as unverified, which
+  blocks nothing and can stop the round posting a verdict at all.
 - Read the code. When the diff cannot settle a question, open the file, grep for the callers, look
   for the test. A claim you did not verify will be deleted by the pass that does.
 - Every finding needs a file, a line, and a consequence. "This looks fragile" is not a finding.

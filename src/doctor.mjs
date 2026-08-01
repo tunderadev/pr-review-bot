@@ -289,7 +289,8 @@ async function addReviewCapabilityChecks(add, appAuth) {
       ? `Authenticated as the GitHub App installation ${login}, so a review it posts is not the operator approving their own PR. (A PR opened by the bot itself would still be refused.)`
       : `Authenticated as ${login || 'an unidentified credential'}${auth.tokenSource ? ` (tokenSource: ${auth.tokenSource})` : ''}, not as a GitHub App installation. ` +
         `GitHub refuses a review on your own pull request with 422 "Can not approve your own pull request" — and only at post time, after the whole review has been paid for. ` +
-        `Check that a personal GITHUB_TOKEN is not shadowing the App credentials (appId, privateKey, installationId).`
+        `No personal token can shadow this: nothing here reads GITHUB_TOKEN, and the credential is minted only from GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_PATH and GITHUB_APP_INSTALLATION_ID. ` +
+        `Check that those three all belong to the same GitHub App installation.`
   )
 
   const granted = auth.permissions && typeof auth.permissions === 'object' ? auth.permissions : {}

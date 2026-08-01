@@ -29,9 +29,13 @@ owner/repo#9 skipped_same_sha
 ```
 
 Each per-PR line is `owner/repo#number <outcome>`, with the verdict in parentheses when there is
-one. The outcomes are `reviewed`, `skipped_same_sha` and `error`; the verdicts are `approved` and
-`changes_requested`. Report them as printed — they are the answer, so you never need to open a PR
-page, and never fill in a verdict that was not printed.
+one. The outcomes are `reviewed`, `skipped_same_sha`, `dry_run` and `error`; the verdicts are
+`approved` and `changes_requested`. Report them as printed — they are the answer, so you never need
+to open a PR page, and never fill in a verdict that was not printed.
+
+`dry_run` should never appear here, because the command above adds no flags — it replaces `reviewed`
+only under `--dry-run`. If you see one, the command was changed: say so, and say that nothing was
+posted, labelled or mirrored to Slack.
 
 Other lines may appear **above** those, emitted by the cycle while it works. Pass them through too:
 

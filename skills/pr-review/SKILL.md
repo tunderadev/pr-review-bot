@@ -19,8 +19,23 @@ node ~/code/pr-review-bot/src/cli.mjs doctor     # before the first live run, an
 node ~/code/pr-review-bot/src/cli.mjs cycle      # exactly one cycle
 ```
 
-Continuously: open a dedicated terminal session and run `/loop 5m /pr-watch`. One runner per team
-config — the `review-in-progress` claim is a read-modify-write with a small race window.
+Continuously: open a dedicated terminal session and run `/loop 5m /pr-review-bot:pr-watch`. The
+command is namespaced by plugin name — bare `/pr-watch` answers `Unknown command`. One runner per
+team config: the `review-in-progress` claim is a read-modify-write with a small race window, and
+`5m` is a poll interval, not a promise that the previous cycle has finished (see **Limits** below).
+
+Installing the plugin, if `/pr-review-bot:pr-watch` does not exist — the repo is its own
+single-plugin marketplace, so a clone path or the git URL both work as the source:
+
+```bash
+claude plugin marketplace add ~/code/pr-review-bot --scope local
+claude plugin install pr-review-bot@pr-review-bot --scope local
+claude plugin details pr-review-bot     # must list BOTH: Skills (2)  pr-review, pr-watch
+```
+
+`--scope` is `user` (every project on this machine), `project` (committed, team-wide) or `local`
+(uncommitted, this checkout). Pass the same scope to both commands. `claude --plugin-dir
+~/code/pr-review-bot` loads it for one session without installing anything.
 
 Three commands, and each flag is refused by the commands that do not implement it:
 
@@ -118,9 +133,16 @@ before considering depth 2, set `"telemetry": true` in `team.json`, let it run a
 
 ```bash
 node ~/code/pr-review-bot/src/cli.mjs report          # avg/max/total per review, by phase and model
-node ~/code/pr-review-bot/src/cli.mjs report --json   # same numbers, machine-readable
+node ~/code/pr-review-bot/src/cli.mjs report --json   # same numbers as JSON — but see the caveat below
 node ~/code/pr-review-bot/src/cli.mjs report --reset  # print the summary, then delete the log
 ```
+
+**`--json` is only parseable once the telemetry file exists.** With no
+`~/.config/pr-review-bot/telemetry.jsonl` — the default state, since telemetry is off — `report
+--json` ignores the flag, prints `No telemetry recorded at …` as prose on **stdout**, and exits `0`.
+`JSON.parse` and `jq` both fail on it. Once the file exists it is JSON on every path, empty file
+included (`{"reviews": 0, …}`). Never assume `report --json` is machine-readable; check the file
+exists, or treat unparseable stdout with exit `0` as "nothing measured yet".
 
 Turn it back off afterward. `report` is purely local — it reads
 `~/.config/pr-review-bot/telemetry.jsonl` and needs no config dir and no credentials, so "what did
@@ -146,6 +168,30 @@ generate many blockers cost proportionally more, whether or not those blockers s
 | 5 | A bug in this tool. Re-run with `PR_REVIEW_DEBUG=1` for the stack trace. |
 
 3 and 4 are the pair that matters: 3 clears itself, 4 never does.
+
+## Limits
+
+Three things the pipeline assumes and does not enforce. All three are documented at length in the
+README's day-2 section.
+
+- **The ledger is editable by anyone with write access.** It is a plain GitHub comment. The parser
+  refuses anything ambiguous and heals from empty, and the cheapest trigger is pasting the marker
+  `<!-- pr-review-bot:state` with no closing `-->`. A reset re-announces in Slack (orphaning the old
+  reaction), restarts round numbering at 1, and overwrites the real history on the next write — but
+  the one that matters is that the next review is no longer handed the previous round's blockers, so
+  it can approve what it once demanded be fixed. Failed rounds leave no row at all, so the round
+  count counts completed reviews, not attempts.
+- **A cycle has no wall-clock bound.** Reviews and refutations are serial: 20 min per review call
+  (up to 2), 5 min per refutation call (up to 2 per blocking finding, first 15 findings only), 5 min
+  per git invocation, all multiplied by `maxPerCycle`. A cycle can easily outlast a 5-minute poll,
+  so a runner that starts
+  ticks on a fixed interval can overlap *itself* — the same double-review the "one runner per team"
+  rule exists to prevent. Lower `maxPerCycle`, or serialise ticks.
+- **The operator's own hooks run against PR code.** The PR's tree is stripped of `.claude/`,
+  `.mcp.json`, `CLAUDE.md` and friends, so the PR cannot execute anything. But the child inherits
+  `HOME` and its working directory is the PR checkout, so hooks in `~/.claude/settings.json` fire
+  there. Global hooks that act on repository content will run, as the operator, against unreviewed
+  code.
 
 ## When something looks stuck
 

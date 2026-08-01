@@ -241,5 +241,9 @@ across machines, and it moves on any edit to this file, including this sentence.
 
 - This file is prompt, not documentation. Rules nobody enforces dilute the ones that matter;
   delete them rather than leaving them for later.
-- Never paste a real token here, not even as an example of what to catch. `doctor` scans this
-  file's contents alongside `team.json` and fails on a token-shaped value.
+- Never paste a real token here, not even as an example of what to catch — and do not rely on
+  anything to stop you. `team.json` is scanned at load, so a token-shaped value in it stops every
+  command with exit `1`. **This file is not.** It is read into the config object after validation
+  has already finished and travels verbatim into the prompt, so a token pasted here reaches a model
+  without a single command failing. The only thing that catches it is `doctor`'s
+  `no credentials in config` check, and only when someone runs `doctor`.

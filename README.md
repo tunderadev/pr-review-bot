@@ -49,7 +49,9 @@ be traced. Surviving blockers map to `REQUEST_CHANGES`, none to `APPROVE`.
 past reviews (used for a head-SHA check — an unchanged head is never re-reviewed, and costs zero
 model calls) and a sticky ledger comment holding the round history, the Slack message binding, and
 the hash of the criteria that produced each verdict. Kill the process mid-cycle and the next run
-picks up from what GitHub says.
+picks up from what GitHub says. That second fact is a plain GitHub comment, editable by anyone with
+write access on the repo, and it is not an audit trail — see *The ledger is not tamper-proof* in
+[section 7](#7-day-2-operations) for what an edit costs.
 
 **The label transitions rather than simply being removed** because the transition *is* the lock and
 the audit trail. Removing `review-requested` and adding `review-in-progress` happens before any
@@ -62,7 +64,7 @@ looks at again.
 
 | | |
 |---|---|
-| **Node** | >= 24 (`package.json` `engines`). No `npm install` — the tool has zero dependencies. |
+| **Node** | >= 24 (`package.json` `engines`). No `npm install` — the tool has zero dependencies, and every command in this README is spelled `node <clone>/src/cli.mjs …`. |
 | **git** | On the `PATH` of the process that runs the loop. Used for the managed clone and worktrees. |
 | **Claude Code CLI** | Installed and **logged in with a Claude subscription**. Every review is a `claude -p` subprocess. |
 | **GitHub** | Permission to create a GitHub App in your org and install it on the repos you want reviewed. |
@@ -80,6 +82,19 @@ Three things about cost, stated plainly before you start:
   the loop pays for it in headroom, so choose deliberately rather than by whoever set it up first.
 - **`--dry-run` spends real quota.** It is the live path with the mutating calls removed: it runs
   the actual review and prints what it would have posted. Pair it with `--limit 1`.
+
+**One note on the name `pr-review-bot`.** The CLI's own usage line and one of its error messages say
+`pr-review-bot doctor`. That is the `bin` name declared in `package.json`, and because there is no
+install step, nothing puts it on your `PATH` — `command -v pr-review-bot` finds nothing. Read every
+such message as `node ~/code/pr-review-bot/src/cli.mjs doctor`, which is the form used throughout
+this README. If you would rather have the short name, opt in once:
+
+```bash
+cd ~/code/pr-review-bot && npm link     # optional — creates `pr-review-bot` on your PATH
+```
+
+`npm link` symlinks the clone rather than copying it, so `git pull` still upgrades what the command
+runs. Nothing else in this document assumes you did it.
 
 ## 4. Adopt in 15 minutes
 
@@ -206,6 +221,12 @@ run the bot under another team's profile and post real reviews under it. Tier 3 
 started the process, which is easy to get wrong from a loop — `doctor` prints which tier won, and
 says so when a `PR_REVIEW_CONFIG_DIR` you set lost to a `--config` flag.
 
+**So pass `--config <dir>` explicitly in anything you do not personally type into a fresh shell** —
+a tuning loop, a cron entry, a launchd job, an editor task. Every `--dry-run` invocation in this
+README, in `skills/pr-review/SKILL.md` and in `criteria/review-criteria.example.md` carries the flag
+for exactly that reason: the loop that tunes criteria is the one most likely to be started from the
+wrong directory, and tier 3 will not tell you it happened.
+
 **Never put secrets in `team.json`.** It is meant to be committed. Validation rejects
 credential-shaped values and stops every command at load.
 
@@ -230,7 +251,9 @@ credential-shaped values and stops every command at load.
 - `authorMap` — GitHub login → Slack member ID (their profile → *Copy member ID*). An unmapped
   author still gets their thread reply, but as unlinked text rather than a ping.
 
-Everything else has a default; see [section 5](#5-config-reference).
+Everything else has a default; see [section 5](#5-config-reference). `config/team.example.json` is
+this same file with every optional key written out at its default — the values are placeholders
+(`acme`, `C0123ABC`, `your-github-login`) and every one of them must be replaced.
 
 ### 7. Run `doctor` — it must be all green
 
@@ -271,7 +294,7 @@ are logged in. The first live cycle proves that.
 Open a PR whose title matches your prefix, add `review-requested`, then:
 
 ```bash
-node ~/code/pr-review-bot/src/cli.mjs cycle --dry-run --limit 1
+node ~/code/pr-review-bot/src/cli.mjs cycle --dry-run --limit 1 --config ~/code/your-product/.claude/pr-review
 ```
 
 ```
@@ -293,28 +316,80 @@ what lets you re-run against an already-reviewed PR while tuning. `--limit 1` is
 etiquette: without it a dry run reviews up to `maxPerCycle` PRs and you pay for all of them on every
 iteration.
 
-### 9. Go live
+### 9. Install the plugin
 
-Make `/pr-watch` available by loading this clone as a plugin — symlink it into your skills
-directory, which auto-loads next session:
+The `pr-watch` command and the `pr-review` skill ship in this repo as a Claude Code plugin. The repo
+is also its own single-plugin marketplace — `.claude-plugin/marketplace.json` points back at the
+repo it lives in — so there is nothing to publish anywhere. Point `marketplace add` at your clone
+and install from it:
 
 ```bash
-mkdir -p ~/.claude/skills
-ln -s ~/code/pr-review-bot ~/.claude/skills/pr-review-bot
+claude plugin marketplace add ~/code/pr-review-bot --scope local
+claude plugin install pr-review-bot@pr-review-bot --scope local
 ```
 
-Then, in a **dedicated terminal session** started from your config home (or with
-`PR_REVIEW_CONFIG_DIR` exported):
+`marketplace add` accepts a filesystem path, a URL, or a GitHub `owner/repo`, so a team can add the
+git URL directly and skip the clone for the plugin's sake. You still want the clone, because the
+command it installs runs `node ~/code/pr-review-bot/src/cli.mjs`.
+
+Confirm both components registered — `install` is quiet about what it actually loaded:
+
+```bash
+claude plugin list                    # pr-review-bot@pr-review-bot — Status: ✔ enabled
+claude plugin details pr-review-bot   # Skills (2)  pr-review, pr-watch
+```
+
+If `details` does not name both `pr-review` and `pr-watch`, the install did not take and `/loop`
+will run against a command that does not exist.
+
+**Choose `--scope` deliberately.** It decides who gets the plugin and whether that choice is
+committed. Both commands write into the settings file for the scope you name — `marketplace add`
+adds an `extraKnownMarketplaces` entry, `install` adds an `enabledPlugins` entry — so pass the same
+scope to both, or a teammate inherits half of the pair:
+
+| `--scope` | Written to | Use it when |
+|---|---|---|
+| `user` (the default) | `~/.claude/settings.json` | You want it in every project on this machine |
+| `project` | `.claude/settings.json` — **committed** | The whole team should get it from the repo |
+| `local` | `.claude/settings.local.json` — gitignored | This machine and this checkout only, uncommitted |
+
+A `project`-scoped install is a real team-wide declaration: the marketplace source is a path or git
+URL in a committed file, so it has to be one everyone can reach — a git URL, not `~/code/…`.
+
+**The command is `/pr-review-bot:pr-watch`, not `/pr-watch`.** Plugin commands are namespaced by the
+plugin's `name` in `.claude-plugin/plugin.json`; the bare form answers `Unknown command: /pr-watch`.
+
+Before committing to any of that, you can load the clone for one session and nothing more:
+
+```bash
+claude --plugin-dir ~/code/pr-review-bot
+```
+
+That registers both components for that session and writes nothing into your plugin configuration —
+no marketplace entry, no `enabledPlugins`, nothing in `~/.claude/plugins/cache/`. It is the
+try-before-you-install path, and the fastest way to check an edit to the command or skill text.
+
+If you followed an earlier version of this README and symlinked the clone into `~/.claude/skills/`,
+remove the symlink before installing. That directory auto-loads whatever it contains as a plugin, so
+leaving it means the same plugin is loaded twice from two places — and it was never the way to get
+`/pr-watch` either, since the command was namespaced there too.
+
+### 10. Go live
+
+In a **dedicated terminal session** started from your config home (or with `PR_REVIEW_CONFIG_DIR`
+exported):
 
 ```
-/loop 5m /pr-watch
+/loop 5m /pr-review-bot:pr-watch
 ```
 
 That is the whole operation: one cycle every five minutes, reporting two or three lines each time.
 Most cycles print `0 PR(s): none`, which is the healthy result. If you would rather not use the
-slash command, `node ~/code/pr-review-bot/src/cli.mjs cycle` on any timer does the identical work.
+slash command, `node ~/code/pr-review-bot/src/cli.mjs cycle` on any timer does the identical work,
+and needs no plugin installed.
 
-**Exactly one runner per team.** See [section 7](#7-day-2-operations).
+**Exactly one runner per team** — and note that five minutes is a poll interval, not a guarantee
+that the previous cycle has finished. See [section 7](#7-day-2-operations).
 
 ## 5. Config reference
 
@@ -322,8 +397,8 @@ Every key `team.json` accepts. Required keys have no default and the run stops a
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `team` | string | **required** | Human-readable team label. Not read by any code path — it is there so a config file identifies itself. |
-| `owner` | string | **required** | Org or user the team belongs to. Also not read by any code path; `repos` carries the real owner. |
+| `team` | **unvalidated** | **required** | Human-readable team label. Only its *presence* is tested, so `"team": 123` and `"team": null` both load. Not read by any code path — it is there so a config file identifies itself. |
+| `owner` | **unvalidated** | **required** | Org or user the team belongs to. Presence-tested only, exactly like `team`: `"owner": {}` loads. Also not read by any code path; `repos` carries the real owner. |
 | `repos` | array of `"owner/name"` | **required** | The allowlist. Must be non-empty. The App must be installed on each. |
 | `titlePrefix` | string (JS regex source) | **required** | Tested against the PR title. Must compile as a regex. Anchor it with `^` yourself. |
 | `slack.channel` | string | **required** | Channel **ID** (`C…`), non-empty. The bot must be invited to it. |
@@ -342,11 +417,17 @@ Every key `team.json` accepts. Required keys have no default and the run stops a
 | `clonesDir` | string (path) | `~/.cache/pr-review-bot/clones` | Where the managed `--filter=blob:none` clones live, one per repo, reused across runs. |
 | `model` | — | **rejected** | Not supported and refused outright. Headless children are spawned without `--model` so they inherit the model you saved as your own Claude CLI default. Accepting the key and ignoring it would leave you believing otherwise; change your model with `/model`. |
 
-Shape is checked for the required keys, for `labels` (an object of non-empty strings), for `slack`
-(an object with a non-empty string `channel`), for `titlePrefix` (a compilable regex) and for
-`depth`. The numeric and boolean keys are taken as written, so a typo there fails at use rather than
-at load. Every value is also scanned for credential shapes; a token-shaped value anywhere in
-`team.json` stops every command at load with exit `1`.
+Shape is checked for `repos` (a non-empty array), for `labels` (an object of non-empty strings), for
+`slack` (an object with a non-empty string `channel`), for `titlePrefix` (a compilable regex) and
+for `depth`. **`team` and `owner` are checked for presence and nothing else** — validation tests
+only `!== undefined`, so `{"team": 123, "owner": {}}` is a valid config. That is not a gap worth
+closing: neither value is read anywhere, so there is no wrong type to catch. Treat the "string" in
+your editor's schema as a convention, not a rule. The numeric and boolean keys are likewise taken as
+written, so a typo there fails at use rather than at load.
+
+Every value in `team.json` is also scanned for credential shapes; a token-shaped value anywhere in
+it stops every command at load with exit `1`. **`review-criteria.md` gets no such check at load** —
+see [section 6](#6-writing-good-review-criteria).
 
 ## 6. Writing good review criteria
 
@@ -354,6 +435,18 @@ at load. Every value is also scanned for credential shapes; a token-shaped value
 interface, and it is where all of the review quality lives — the machinery is generic.
 `criteria/review-criteria.example.md` in this repo is the annotated starting template; read it
 before editing rules.
+
+Two consequences of "pasted into the prompt", neither of them obvious:
+
+- **The whole file is prompt, verbatim.** It is read straight off disk into the review prompt with
+  no parsing, no allowlist and no escaping. Anything in it that reads as an instruction is an
+  instruction, not a rule the reviewer weighs.
+- **It is not scanned for secrets when it is loaded.** `team.json` is: a token-shaped value anywhere
+  in it stops every command at load with exit `1`. `review-criteria.md` gets no equivalent check —
+  it is read into the config object after validation has already run, so a token pasted into it
+  reaches a model without a single command failing. The only thing that catches it is `doctor`'s
+  `no credentials in config` check, and only when someone runs `doctor`. Never paste a real token
+  here, not even as an example of what to catch.
 
 The one fact that shapes everything: **only `blocking` findings are ever verified, and the verifier
 is told to refute when uncertain.** A vague blocking rule does not produce a bad review, it produces
@@ -418,10 +511,13 @@ gives the verifier something it can fail to refute.
 - **Then verify**, against a real PR, publishing nothing:
 
   ```bash
-  node ~/code/pr-review-bot/src/cli.mjs cycle --dry-run --limit 1
+  node ~/code/pr-review-bot/src/cli.mjs cycle --dry-run --limit 1 --config <your config dir>
   ```
 
-  Edit → dry-run → read the rendered review → adjust → repeat.
+  Edit → dry-run → read the rendered review → adjust → repeat. `--config` is not optional here even
+  though a bare `cycle` would often resolve the same directory: this loop is run over and over from
+  whatever shell happens to be open, and tier 3 resolves against the process's working directory
+  without saying so.
 
 Heuristic: if *could*, *might*, *consider*, *fragile* or *in the future* appears in a blocking
 claim, it is a mislabelled nit and the verification pass will delete it a minute later.
@@ -483,8 +579,23 @@ is wrong with the PR. Remove it by hand and re-add `review-requested`.
 cd ~/code/pr-review-bot && git pull
 ```
 
-That is all of it. No team configuration lives in this repo, so there is nothing to merge and
-nothing to re-apply. Run `doctor` afterwards.
+That upgrades everything that reviews anything. No team configuration lives in this repo, so there
+is nothing to merge and nothing to re-apply, and `/pr-review-bot:pr-watch` runs
+`node ~/code/pr-review-bot/src/cli.mjs` straight out of the clone, so it picks the new code up on
+the next cycle. Run `doctor` afterwards.
+
+**The installed plugin is a separate copy, and `git pull` does not touch it.**
+`claude plugin install` copies the repo into `~/.claude/plugins/cache/` under the `version` in
+`.claude-plugin/plugin.json`. That copy supplies only the command and skill *text* — never the code
+— so a stale one costs you nothing but a stale description. It is also genuinely pinned:
+`claude plugin update` answers `already at the latest version (0.1.0)` and refreshes nothing while
+the version is unchanged. When the command or skill text changes, either bump `version` and update,
+or reinstall:
+
+```bash
+claude plugin uninstall pr-review-bot@pr-review-bot --scope local
+claude plugin install   pr-review-bot@pr-review-bot --scope local
+```
 
 ### Measuring cost
 
@@ -497,7 +608,7 @@ deciding whether a deeper review mode is affordable, or when reviews feel expens
 
 ```bash
 node ~/code/pr-review-bot/src/cli.mjs report          # avg/max/total per review, by phase and model
-node ~/code/pr-review-bot/src/cli.mjs report --json   # same numbers, machine-readable
+node ~/code/pr-review-bot/src/cli.mjs report --json   # same numbers as JSON — but read the caveat below
 node ~/code/pr-review-bot/src/cli.mjs report --reset  # print the summary, THEN delete the log
 ```
 
@@ -518,6 +629,23 @@ Depth 2 runs roughly 3-4x the review phase. Projected avg: $0.789 per review.
 `~/.config/pr-review-bot/telemetry.jsonl`, so nothing accumulates on disk and you cannot lose the
 figure you were about to read. Nothing is kept — no rotation, no `.bak`.
 
+**`--json` is machine-readable only once the telemetry file exists.** When
+`~/.config/pr-review-bot/telemetry.jsonl` is absent — which is the normal state, since telemetry is
+off by default — `report --json` prints a plain-English notice on **stdout** and exits `0`. The flag
+is not consulted on that path, so `report --json | jq` fails on the first character:
+
+```console
+$ node ~/code/pr-review-bot/src/cli.mjs report --json
+No telemetry recorded at /Users/you/.config/pr-review-bot/telemetry.jsonl. Set "telemetry": true in team.json to start measuring.
+$ echo $?
+0
+```
+
+Once the file exists it is JSON on every path, including an empty file
+(`{"reviews": 0, "totalCostUsd": 0, …}`). So a script must either check the file exists first, or
+treat unparseable stdout with exit `0` as "nothing measured yet" rather than as a failure. Under
+`--reset`, the "log cleared" notice goes to stderr, so stdout stays pipeable.
+
 `report` is purely local. It needs no config directory and no credentials, so "what did this cost
 me" is answerable even from a broken installation.
 
@@ -535,6 +663,99 @@ Designate exactly one person to run the loop for a given config, and say who it 
   "unclaimed" in the same instant and both review the same PR, posting two reviews.
 - **Each runner spends their own subscription quota**, on the same plan funding their interactive
   work, so "who runs it" is a real cost decision and not an implementation detail.
+
+### A cycle has no wall-clock bound, so one operator can overlap themselves
+
+`5m` in `/loop 5m /pr-review-bot:pr-watch` is a poll interval, not a schedule. Nothing in this tool
+bounds how long a cycle takes, and a cycle is entirely serial — PRs one at a time, blocking findings
+one at a time — under timeouts sized to catch a *wedged* child, not a slow one:
+
+| Step | Limit | Attempts |
+|---|---|---|
+| git clone / fetch | 5 min per git invocation | — |
+| Review call | 20 min | up to 2 — a second if the first response is not valid JSON |
+| Refutation call | 5 min | up to 2, **per blocking finding**, one after another — the first 15 findings of a review only |
+
+So a single PR with three blocking findings can legitimately occupy 40 minutes of review plus 30
+minutes of refutation before the cycle even reaches the second of `maxPerCycle` PRs, and the
+fifteen-finding cap puts the ceiling for one PR near three hours. Nothing is wrong when that
+happens — that is the design, and a review worth having is worth waiting for.
+
+The consequence is the one the previous section describes for two operators, except you do not need
+a second person to reach it. **If your runner starts a tick on a fixed interval regardless of
+whether the previous one finished** — a cron entry, a `while true; do …; sleep 300; done` — then a
+long cycle and the next tick overlap, and two cycles *of yours* can both read the same PR as
+unclaimed and both review it. The `review-in-progress` claim narrows that window; it does not close
+it. So:
+
+- Confirm how your runner behaves before relying on it. If it does not serialise ticks, either
+  serialise them yourself (a lockfile, or a loop that sleeps *after* the cycle returns) or pick an
+  interval you are confident exceeds a cycle.
+- `maxPerCycle` is the real lever: it caps the serial work in a tick, so lowering it shortens the
+  worst case proportionally.
+- Watch the terminal rather than the clock. A tick that has not reported yet is a cycle still
+  working, not a hung one.
+
+### The ledger is not tamper-proof
+
+The sticky ledger comment is an ordinary GitHub comment, and every collaborator with write access on
+the repo can edit it. The parser is deliberately strict — anything it cannot read unambiguously
+returns nothing at all, and the cycle heals by starting from an empty state rather than guessing.
+The cheapest way to trigger that is to paste the marker string into the comment with no closing
+`-->`:
+
+```
+<!-- pr-review-bot:state
+```
+
+That is one line typed into a comment box, using no privilege the person did not already have. What
+the reset costs, in order of how much it matters:
+
+- **The next review is no longer told what the last one blocked on.** The reviewer is handed the
+  previous round's surviving blockers, read from the last row of the ledger. After a reset there is
+  no last row, so it reviews as though the PR had never been reviewed — and it can approve code it
+  had previously demanded be fixed.
+- **The real history is overwritten.** The next successful round rewrites the comment from the empty
+  state. The bot's posted reviews are still on the PR, but the round history, the criteria hashes
+  and the Slack binding are gone.
+- **Round numbering restarts at 1**, so a review body reads "Round 1" on a PR that has had four.
+- **The Slack binding is lost**, so the PR is announced again as a brand-new message. The reaction
+  on the previous announcement is orphaned, and nothing ever comes back to move it.
+
+Two related facts about what the ledger never records:
+
+- **A failed round leaves no row.** When a PR errors, only the Slack binding is written back — no
+  `errored` round is appended. That is deliberate: an error round would carry an empty blocker list,
+  which would make the next review forget the outstanding blockers in exactly the way a reset does.
+  The ledger's round count is therefore a count of completed reviews, not of attempts.
+- The strictness cuts both ways. GitHub truncates long comment bodies, and the block it truncates is
+  the bot's own, because that is written last — so an ordinary busy PR can reset the ledger with
+  nobody touching anything.
+
+There is no fix short of keeping state somewhere the PR's collaborators cannot write, which this
+tool deliberately does not do. Treat the ledger as a convenience. When a verdict matters, the GitHub
+review is the record.
+
+### Your own hooks still run against the PR's code
+
+A pull request can no longer execute code through files in its own tree. The worktree handed to the
+reviewer is stripped of `.claude/`, `.claude-plugin/`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`
+and `AGENTS.md` — case-insensitively, so a `.CLAUDE/` committed on a case-sensitive filesystem does
+not slip past on macOS. The child is spawned with `--strict-mcp-config` so no `.mcp.json` is
+discovered wherever it sits, its `PATH` is stripped of relative entries so a `claude` committed at
+the repo root cannot be resolved, and its environment is an explicit allowlist carrying none of this
+tool's credentials.
+
+What is **not** stripped, and cannot be, is your own configuration. The child inherits `HOME`, so
+the hooks declared in your `~/.claude/settings.json` load normally — and its working directory is
+the checkout of the PR head. **If you have global hooks that act on repository content** — a
+`SessionStart` hook that formats, lints, indexes, installs, or shells out at all — **they will run,
+as you, with unreviewed pull-request code as the working directory.** On a repo that accepts fork
+PRs, whoever opened the PR chose that content.
+
+That is a property of hooks being global rather than a defect here, and there is nothing this tool
+can remove to prevent it. If your user-level hooks do more than read, scope them to the projects
+they belong to, or accept that they run here too.
 
 ### Exit codes
 
@@ -555,7 +776,8 @@ The loop and any cron wrapper branch on these, so each means exactly one thing.
 
 | Symptom | Cause |
 |---|---|
-| `422 Can not approve your own pull request` in a failure line, or the review body appears as a plain comment headed with a warning | The credential in use is **not** the App installation — usually a personal `GITHUB_TOKEN` shadowing the App variables. Run `doctor` and read `github identity`; it must say `…[bot]`. The review body is preserved as a comment rather than lost, and the PR wears `review-error` |
+| `422 Can not approve your own pull request` in a failure line | GitHub refuses a review whose author is the identity posting it, so **the PR was opened by the same App installation that is reviewing it**. Not a stray personal token: nothing in `src/` reads `GITHUB_TOKEN`, and the only credential is minted from the App ID, private key and installation ID (`src/github-auth.mjs`), so there is no variable a personal token could shadow. `doctor`'s `github identity` line names the identity in use and says this outright — *(A PR opened by the bot itself would still be refused.)* If it reads `…[bot]` and matches whoever opened the PR, that is the whole answer |
+| The review body appears as a plain comment headed with a warning | Wider than the row above: **any** non-transient rejection of the review POST preserves the body as a comment rather than losing it, not only a 422. Read the `owner/repo#N failed: …` line — it carries the status and message GitHub actually returned. Either way the PR wears `review-error` |
 | `Slack chat.postMessage failed: not_in_channel` | The bot is not a member of the channel. `/invite @your-bot-name` in it |
 | `Slack chat.postMessage failed: channel_not_found` | `slack.channel` is a name or a stale ID. It must be the channel **ID** (`C…`) from *View channel details*, and the bot must be able to see the channel |
 | `doctor` is green on `slack post` but red on `slack reactions` | `reactions:write` is missing — it is a separate scope from `chat:write`. Add it and **reinstall** the app; a scope added without reinstalling does not take effect |
@@ -637,7 +859,10 @@ pointing at that path.
 - **Reviewing PRs whose titles do not match the team prefix.**
 - **Cross-organization support** in v1.
 - **Leader election or distributed locking between runners.** One runner per team, by convention.
-- **Publishing to a plugin marketplace.**
+- **Publishing to a shared or third-party plugin marketplace.** The repo carries its own
+  single-plugin `.claude-plugin/marketplace.json` pointing back at itself, so
+  `claude plugin marketplace add <clone or git URL>` installs it directly. Nothing is submitted
+  anywhere, and there is no marketplace for a team to maintain.
 - **Inline, line-anchored review comments** in v1 — findings reference `file:line` in the review
   body instead. Inline comments require validating each line against the diff hunks or the API
   rejects the whole review; a documented later enhancement, config-gated and default off.

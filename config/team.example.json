@@ -1,7 +1,7 @@
 {
   "team": "platform",
-  "owner": "octocat",
-  "repos": ["octocat/storefront"],
+  "owner": "acme",
+  "repos": ["acme/storefront", "acme/checkout-api"],
   "titlePrefix": "^\\[PLAT\\]",
   "labels": {
     "requested": "review-requested",
@@ -12,7 +12,7 @@
     "channel": "C0123ABC",
     "emoji": { "inReview": "eyes", "approved": "white_check_mark", "changesRequested": "x", "error": "warning" }
   },
-  "authorMap": { "octocat": "U0123ABC" },
+  "authorMap": { "your-github-login": "U0123ABC" },
   "maxPerCycle": 3,
   "maxDiffLines": 3000,
   "depth": "standard",

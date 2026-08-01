@@ -41,6 +41,26 @@ export function parseRefutation(text) {
     : { refuted: true, why: 'refutation verdict unreadable' }
 }
 
+// This pass is the only unbounded fan-out in the pipeline: one child per
+// blocking finding, run serially, each allowed five minutes, and each retried
+// once. Measured before this existed — 2000 findings spawned 2000 children, and
+// 100 findings with a retry apiece spawned 200 — a worst case per PR of
+// 2 × 20min + 2 × N × 5min, over seventeen hours at N=100, all of it drawn from
+// the operator's personal Claude subscription while their own work waits.
+//
+// Fifteen, because a review claiming more than about fifteen blocking defects
+// is not an actionable review — nobody works through that list — so the cap is
+// reached only when something has already gone wrong. It bounds a PR at
+// 40 + 150 minutes rather than at nothing.
+export const MAX_REFUTATIONS = 15
+
+// The cap must never silently shrink a review. This sentence is published into
+// the "Not verified" section of the review body, so it says plainly that
+// nothing looked at these — never that they were cleared — and carries no path
+// or internal state.
+const cappedReason = (total) =>
+  `not verified: this review raised ${total} blocking findings and only the first ${MAX_REFUTATIONS} are verified`
+
 export async function refuteBlockers({ findings, pr, cwd, spawnImpl, timeoutMs }) {
   // Nits are never verified. They cannot change the verdict, so a refutation
   // call on one spends real quota and wall-clock for nothing — and the common
@@ -66,7 +86,19 @@ export async function refuteBlockers({ findings, pr, cwd, spawnImpl, timeoutMs }
     const verdict = readVerdict(run.result)
     return verdict.readable ? { refuted: verdict.refuted, why: verdict.why, unverified: false } : null
   }
-  for (const finding of blockers) {
+  // Beyond the cap nothing is asked and nothing is asserted. They are recorded
+  // exactly as a timed-out or errored refutation is — unverified — because that
+  // is what they are, and it is what makes them show up in the review's "Not
+  // verified" section and makes `degraded` true below. Two things follow, and
+  // both are deliberate: an unchecked finding never BLOCKS the author, since
+  // uncertainty must not cost a round trip on a claim that may well be wrong;
+  // and an unchecked finding is never quietly approved over either, because
+  // degraded-with-no-survivors refuses to post a verdict at all. The order is
+  // the model's own, which puts what it considered most serious first.
+  for (const finding of blockers.slice(MAX_REFUTATIONS)) {
+    refuted.push({ ...finding, refutation: cappedReason(blockers.length), unverified: true })
+  }
+  for (const finding of blockers.slice(0, MAX_REFUTATIONS)) {
     const prompt = buildRefutationPrompt({ finding, pr })
     let verdict
     try {

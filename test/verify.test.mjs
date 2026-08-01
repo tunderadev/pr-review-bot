@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { Readable, Writable } from 'node:stream'
-import { buildRefutationPrompt, parseRefutation, refuteBlockers } from '../src/verify.mjs'
+import { buildRefutationPrompt, parseRefutation, refuteBlockers, MAX_REFUTATIONS } from '../src/verify.mjs'
 
 const PR = { repo: 'o/r', number: 7, headSha: 'abc1234' }
 const blocking = (claim) => ({ severity: 'blocking', file: 'src/a.ts', line: 1, claim, why: 'w' })
@@ -336,4 +336,81 @@ test('parseRefutation refuses to read a verdict out of a non-boolean or a missin
   // become refute-always, or the pass would be a no-op that drops everything.
   assert.equal(parseRefutation('```json\n{"refuted":false,"why":"real"}\n```').refuted, false)
   assert.equal(parseRefutation('After reading src/a.ts:\n{"refuted": false, "why": "real"}\nThat is my answer.').refuted, false)
+})
+
+// ---------------------------------------------------------------------------
+// The fan-out cap
+//
+// Two calls per blocking finding, run serially, each with a five-minute budget.
+// Measured before the cap existed: 2000 findings spawned 2000 children, and 100
+// findings with one retry apiece spawned 200 — a worst case of over seventeen
+// hours on one PR, drawn from the operator's personal subscription.
+// ---------------------------------------------------------------------------
+
+const answers = (n, text = '{"refuted":true,"why":"guarded upstream"}') => Array.from({ length: n }, () => text)
+const manyBlockers = (n) => Array.from({ length: n }, (_, i) => blocking(`claim ${i}`))
+
+test('the number of findings refuted per PR is capped', async () => {
+  const impl = fakeSpawn(answers(200))
+  await refuteBlockers({ findings: manyBlockers(200), pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(impl.calls.length, MAX_REFUTATIONS, 'a review with 200 blockers must not spawn 200 children')
+})
+
+test('findings past the cap are reported as unverified, never dropped in silence', async () => {
+  // Enough answers for EVERY finding, deliberately: run the fake out of them and
+  // the uncapped findings come back unverified because nothing answered, which
+  // is the same shape the cap produces and would pass this test on its own.
+  const impl = fakeSpawn(answers(MAX_REFUTATIONS + 4))
+  const out = await refuteBlockers({ findings: manyBlockers(MAX_REFUTATIONS + 4), pr: PR, cwd: '/wt', spawnImpl: impl })
+
+  assert.equal(
+    out.survivors.length + out.refuted.length,
+    MAX_REFUTATIONS + 4,
+    'every finding the review raised has to come out somewhere'
+  )
+  const uncapped = out.refuted.filter((f) => f.unverified)
+  assert.equal(uncapped.length, 4)
+  // The rendering layer prints this sentence into a public review body, so it
+  // has to read as "nobody checked this", not as a refutation on the merits.
+  for (const f of uncapped) assert.match(f.refutation, /not verified/i, f.refutation)
+  assert.match(uncapped[0].refutation, new RegExp(String(MAX_REFUTATIONS)), 'and it has to say what the limit was')
+  assert.deepEqual(uncapped.map((f) => f.claim), manyBlockers(MAX_REFUTATIONS + 4).slice(MAX_REFUTATIONS).map((f) => f.claim))
+})
+
+test('an unverified finding past the cap does not block the author', async () => {
+  // Uncertainty must not block a PR: nothing looked at these, so putting them in
+  // front of the author as blocking costs a round trip over claims that may well
+  // be wrong. They are named in the review instead.
+  const impl = fakeSpawn(answers(MAX_REFUTATIONS + 3, '{"refuted":false,"why":"confirmed"}'))
+  const out = await refuteBlockers({ findings: manyBlockers(MAX_REFUTATIONS + 3), pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(out.survivors.length, MAX_REFUTATIONS, 'only findings something actually judged may survive')
+  assert.equal(out.survivors.some((f) => f.unverified), false)
+})
+
+test('a capped pass is degraded, so zero survivors can never become an approval', async () => {
+  // The dangerous shape: every checked finding is refuted, and the unchecked
+  // ones are invisible. Zero survivors reads identically to a clean review, and
+  // approving a PR carrying blocking claims nobody looked at is the worst thing
+  // this tool can do.
+  const impl = fakeSpawn(answers(MAX_REFUTATIONS + 1))
+  const out = await refuteBlockers({ findings: manyBlockers(MAX_REFUTATIONS + 1), pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.deepEqual(out.survivors, [])
+  assert.equal(out.degraded, true, 'the caller must be told the verdict is unknown')
+})
+
+test('a review exactly at the cap is fully verified and not degraded', async () => {
+  const impl = fakeSpawn(answers(MAX_REFUTATIONS))
+  const out = await refuteBlockers({ findings: manyBlockers(MAX_REFUTATIONS), pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(impl.calls.length, MAX_REFUTATIONS)
+  assert.equal(out.degraded, false, 'an off-by-one here silently benches an ordinary PR')
+  assert.equal(out.refuted.some((f) => f.unverified), false)
+})
+
+test('nits do not consume the cap', async () => {
+  const nit = (i) => ({ severity: 'nit', file: 'f', line: 1, claim: `nit ${i}`, why: 'w' })
+  const findings = [...Array.from({ length: 30 }, (_, i) => nit(i)), ...manyBlockers(3)]
+  const impl = fakeSpawn(answers(3))
+  const out = await refuteBlockers({ findings, pr: PR, cwd: '/wt', spawnImpl: impl })
+  assert.equal(impl.calls.length, 3, 'nits are never verified, so they cannot crowd out a blocker')
+  assert.equal(out.degraded, false)
 })

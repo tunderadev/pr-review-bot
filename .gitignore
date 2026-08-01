@@ -21,3 +21,6 @@ criteria/review-criteria.md
 
 node_modules/
 .DS_Store
+
+# Local mutation-testing scratch harness
+.mutate.sh

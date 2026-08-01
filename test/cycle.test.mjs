@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runCycle, REVIEW_FALLBACK_NOTE } from '../src/cycle.mjs'
+import { runCycle, REVIEW_FALLBACK_NOTE, DiscoveryError } from '../src/cycle.mjs'
 import { createCheckouts } from '../src/checkout.mjs'
 import { renderStateComment, emptyState, appendRound, parseState } from '../src/state.mjs'
 import { TransientError, FatalError } from '../src/github.mjs'
@@ -761,6 +761,45 @@ test('a successful review posts no fallback comment', async () => {
   const comments = named(actions, 'comment')
   assert.equal(comments.length, 1, 'round 1 writes exactly one comment')
   assert.ok(parseState(comments[0][1]), 'and it is the ledger, not a copy of the review')
+})
+
+// ---------------------------------------------------------------------------
+// Discovery failures
+//
+// listOpenPrs is the most frequent GitHub call this tool makes — every repo,
+// every cycle — and it runs outside the per-PR try. Anything it threw escaped
+// into the CLI's generic catch and was reported as a bug in the tool, telling
+// the operator not to attempt a fix, over a routine 429.
+// ---------------------------------------------------------------------------
+
+test('a transient failure while listing PRs defers the whole cycle rather than crashing', async () => {
+  const { deps, actions } = makeDeps({
+    github: { listOpenPrs: async () => { throw new TransientError('GitHub GET /repos/o/r/pulls failed (429): rate limit exceeded') } },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(out.aborted, true, 'a rate limit clears itself — the next cycle just tries again')
+  assert.deepEqual(out.processed, [])
+  assert.match(out.reason, /429/)
+  assert.equal(actions.length, 0, 'nothing was claimed, so nothing may be labelled')
+})
+
+test('an unreachable repo is a configuration error naming the repo, not an internal bug', async () => {
+  const { deps } = makeDeps({
+    github: { listOpenPrs: async () => { throw new FatalError('GitHub GET /repos/o/r/pulls failed (404): Not Found') } },
+  })
+  const err = await runCycle({ config, deps, now: NOW }).then(() => null, (e) => e)
+  assert.ok(err, 'a repo that cannot be listed cannot be skipped over')
+  assert.ok(err instanceof DiscoveryError, `got ${err.constructor.name}: ${err.message}`)
+  assert.match(err.message, /o\/r/, 'the operator has to be told which repo')
+  assert.match(err.message, /404/)
+})
+
+test('a payload discovery cannot read is a configuration error too, never a crash mid-queue', async () => {
+  const { deps } = makeDeps({
+    github: { listOpenPrs: async () => { throw new FatalError('GitHub GET /repos/o/r/pulls returned object where a list was expected') } },
+  })
+  const err = await runCycle({ config, deps, now: NOW }).then(() => null, (e) => e)
+  assert.ok(err instanceof DiscoveryError, `got ${err?.constructor.name}: ${err?.message}`)
 })
 
 test('maxPerCycle is a whole-cycle budget, spent oldest-first across every repo', async () => {

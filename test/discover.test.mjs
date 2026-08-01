@@ -30,6 +30,23 @@ test('normalizePr flattens the fields later tasks need', () => {
   })
 })
 
+// A deleted GitHub account arrives as user: null. Dereferencing it threw a
+// TypeError out of discovery itself, which runs before any PR is claimed — so
+// one deleted account stopped every repo from being looked at.
+test('a PR whose author account is gone is still reviewable', () => {
+  const orphan = raw({ number: 1, user: null })
+  assert.equal(normalizePr(orphan).author, null)
+  assert.deepEqual(selectPrs([orphan], config).map((p) => p.number), [1])
+})
+
+test('a payload with no base repository is dropped instead of crashing discovery', () => {
+  const prs = [raw({ number: 1, base: {} }), raw({ number: 2, base: { repo: null } }), raw({ number: 3, head: null }), raw({ number: 4 })]
+  assert.equal(normalizePr(prs[0]).repo, null)
+  // There is no repository to address and no commit to check out, so there is
+  // nothing a review could be run against — but the OTHER PRs must still be.
+  assert.deepEqual(selectPrs(prs, config).map((p) => p.number), [4])
+})
+
 test('selects only labeled, prefix-matching, open PRs', () => {
   const prs = [
     raw({ number: 1 }),

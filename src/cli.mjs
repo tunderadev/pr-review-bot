@@ -11,7 +11,7 @@ import { createCheckouts } from './checkout.mjs'
 import { runReview } from './review.mjs'
 import { refuteBlockers } from './verify.mjs'
 import { createTelemetry, summarize, resetTelemetry, DEFAULT_TELEMETRY_PATH } from './telemetry.mjs'
-import { runCycle } from './cycle.mjs'
+import { runCycle, DiscoveryError } from './cycle.mjs'
 import { runDoctor } from './doctor.mjs'
 
 // Exit codes are the API a cron wrapper or `/loop` branches on, so each one has
@@ -434,7 +434,20 @@ export async function main(argv, options = {}) {
       )
     }
 
-    const result = await cycle({
+    // Discovery is the one part of the cycle with no PR to label, so its
+    // failures leave runCycle instead of being absorbed. A DiscoveryError is
+    // deterministic and names what to change, which is exactly what exit 1
+    // means; everything else stays a bug and stays exit 5.
+    const runCycleOrExplain = async (args) => {
+      try {
+        return await cycle(args)
+      } catch (e) {
+        if (e instanceof DiscoveryError) throw new CliError(e.message)
+        throw e
+      }
+    }
+
+    const result = await runCycleOrExplain({
       // A per-invocation override of maxPerCycle, applied by copy so the loaded
       // config is never mutated. Absent means the configured value stands.
       config: limit === undefined ? config : { ...config, maxPerCycle: limit },

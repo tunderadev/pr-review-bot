@@ -20,6 +20,18 @@ export const REFUTATION_TIMEOUT_MS = 5 * 60_000
 // nobody can calibrate.
 export const TRUNCATION_NOTE = '(further files beyond the pagination cap — not retrieved)'
 
+// Discovery runs OUTSIDE the per-PR try, because there is no PR yet to label —
+// so whatever it throws leaves runCycle entirely. Left as a bare GitHub error
+// that landed in the CLI's generic catch and was reported as "a bug in
+// pr-review-bot, not a configuration problem", telling the operator not to
+// attempt a fix, for a repo typo'd in team.json or an App never installed on it.
+// This type is what lets the CLI answer with the exit code the condition
+// actually has: an operator-fixable configuration error.
+//
+// Transient discovery failures never reach this — they abort the cycle the same
+// way a transient per-PR failure does, because they clear themselves.
+export class DiscoveryError extends Error {}
+
 const sizeOf = (f) => (f.additions || 0) + (f.deletions || 0)
 
 export function buildDiff(files, maxDiffLines) {
@@ -248,7 +260,23 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
 
   const candidates = []
   for (const repo of config.repos) {
-    const open = await github.listOpenPrs(repo)
+    let open
+    try {
+      open = await github.listOpenPrs(repo)
+    } catch (error) {
+      // A 429 or a 502 on the most frequent call this tool makes is not news:
+      // nothing has been claimed, so there is nothing to label and nothing to
+      // clean up — the next cycle simply asks again.
+      if (isTransientFailure(error)) {
+        log(`Listing pull requests for ${repo} failed transiently: ${error.message}. Nothing was claimed; the next cycle will try again.`)
+        return { processed, aborted: true, reason: error.message }
+      }
+      throw new DiscoveryError(
+        `Could not list open pull requests for ${repo}: ${error.message}\n` +
+          `Check that "${repo}" is spelled correctly in team.json and that the GitHub App is installed on it with pull-request read access.`,
+        { cause: error }
+      )
+    }
     candidates.push(...selectPrs(open, config))
     // Said out loud every cycle. The alternative is a PR that was re-labelled by
     // a human sitting in silence indefinitely, which is the failure the sticky

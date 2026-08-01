@@ -13,6 +13,7 @@ import { parseArgs, parseDotEnv, requireEnv, main, EXIT } from '../src/cli.mjs'
 import { runReview } from '../src/review.mjs'
 import { refuteBlockers } from '../src/verify.mjs'
 import { runDoctor } from '../src/doctor.mjs'
+import { DiscoveryError } from '../src/cycle.mjs'
 import { getInstallationToken, getBotLogin } from '../src/github-auth.mjs'
 
 // ---------------------------------------------------------------------------
@@ -776,6 +777,22 @@ test('an unknown command exits 1 with usage, not a stack trace', async () => {
   assert.equal(code, EXIT.config)
   assert.match(text(out), /Unknown command "frobnicate"/)
   assert.match(text(out), /cycle/)
+  noStack(out)
+})
+
+// A 404 on the most frequent GitHub call the bot makes — a repo typo'd in
+// team.json, or one the App was never installed on — used to exit 5, which
+// tells the operator this is a bug in the tool and not to attempt a fix.
+test('a discovery failure the operator can fix exits 1, not 5', async () => {
+  const { opts, out } = harness({
+    cycle: async () => {
+      throw new DiscoveryError('Could not list open pull requests for acme/api: GitHub GET /repos/acme/api/pulls failed (404): Not Found')
+    },
+  })
+  const code = await main([], opts)
+  assert.equal(code, EXIT.config)
+  assert.match(text(out), /acme\/api/)
+  assert.doesNotMatch(text(out), /bug in pr-review-bot/, 'a typo in team.json is not a bug in the tool')
   noStack(out)
 })
 

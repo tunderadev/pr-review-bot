@@ -2,5 +2,6 @@
   "name": "pr-review-bot",
   "version": "0.1.0",
   "description": "Watches allowlisted repos for prefix-matched PRs labeled review-requested, reviews them against team criteria, and syncs verdicts to GitHub and Slack.",
+  "author": { "name": "pr-review-bot maintainers" },
   "keywords": ["pull-request", "code-review", "github", "slack", "automation"]
 }

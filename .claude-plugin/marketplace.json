@@ -1,0 +1,12 @@
+{
+  "name": "pr-review-bot",
+  "description": "Single-plugin marketplace for pr-review-bot, so a clone or git URL of this repo installs directly with `claude plugin marketplace add`.",
+  "owner": { "name": "pr-review-bot maintainers" },
+  "plugins": [
+    {
+      "name": "pr-review-bot",
+      "description": "Watches allowlisted repos for prefix-matched PRs labeled review-requested, reviews them against team criteria, and syncs verdicts to GitHub and Slack.",
+      "source": "./"
+    }
+  ]
+}

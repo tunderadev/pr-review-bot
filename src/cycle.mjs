@@ -1,4 +1,4 @@
-import { selectPrs } from './discover.mjs'
+import { selectPrs, prsBlockedByError } from './discover.mjs'
 import { TransientError, FatalError, isRetryableTransportCode } from './github.mjs'
 import { ReviewTimeoutError, isUsageLimit } from './review.mjs'
 import { emptyState, parseState, findSticky, renderStateComment, appendRound, alreadyReviewedSha, lastRound } from './state.mjs'
@@ -248,7 +248,19 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
 
   const candidates = []
   for (const repo of config.repos) {
-    candidates.push(...selectPrs(await github.listOpenPrs(repo), config))
+    const open = await github.listOpenPrs(repo)
+    candidates.push(...selectPrs(open, config))
+    // Said out loud every cycle. The alternative is a PR that was re-labelled by
+    // a human sitting in silence indefinitely, which is the failure the sticky
+    // label's whole design depends on NOT happening.
+    const blocked = prsBlockedByError(open, config)
+    if (blocked.length) {
+      log(
+        `${repo}: ${blocked.length} PR(s) carry the ${config.labels.error} label and were skipped — ` +
+          `${blocked.map((pr) => `#${pr.number}`).join(', ')}. That label is never cleared automatically: ` +
+          `fix what failed, remove it, then re-add ${config.labels.requested}.`
+      )
+    }
   }
   // selectPrs already caps and orders WITHIN a repo, so this second pass only
   // matters across them — and it is the difference between a per-cycle budget
@@ -427,6 +439,14 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       await github
         .addLabel(pr.repo, pr.number, transient ? config.labels.requested : config.labels.error)
         .catch(() => {})
+      // The two labels are opposite instructions and must never be readable at
+      // once. A failure BEFORE the claim never removed the trigger label, so the
+      // PR wore both: selection saw review-requested, failed identically, and
+      // re-applied review-error every cycle forever. Unconditional rather than
+      // `if (!claimed)`, because a human can add the trigger label back while a
+      // review is in flight, and the DELETE tolerates a 404 anyway. It follows
+      // the addLabel above so the PR is never momentarily unlabelled.
+      if (!transient) await github.removeLabel(pr.repo, pr.number, config.labels.requested).catch(() => {})
       if (phase) recordRuns({ telemetry, log, pr, round: state.rounds.length + 1, phase, at: now, runs: runsOf(error) })
       if (!transient) {
         // ⚠️ replaces 👀. A per-PR failure is a third terminal state, and since

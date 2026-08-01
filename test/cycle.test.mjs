@@ -401,6 +401,46 @@ test('per-PR failure sets sticky review-error and continues', async () => {
   assert.equal(named(actions, 'add-label', 'review-requested').length, 0, 'poison PR must not be re-queued')
 })
 
+// The label IS the decision the next cycle reads, so the two must never be
+// readable at once. A fatal failure before the claim used to leave the trigger
+// label in place and add the sticky one on top: the PR was re-selected next
+// cycle, failed identically, and re-applied the label forever.
+test('a failure before the claim leaves review-error alone on the PR, not both labels', async () => {
+  const { deps, actions } = makeDeps({
+    github: { listReviews: async () => { throw new FatalError('GitHub GET /repos/o/r/pulls/7/reviews failed (422): unprocessable') } },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(out.processed[0].outcome, 'error')
+  assert.equal(named(actions, 'add-label', 'review-error').length, 1)
+  assert.equal(named(actions, 'remove-label', 'review-requested').length, 1, 'the trigger label has to come off, or the PR is re-selected forever')
+  // Order matters: the sticky label goes on first, so nothing in between can
+  // leave the PR wearing no label at all — a state no cycle would pick up.
+  const applied = actions.findIndex((a) => a[0] === 'add-label' && a[1] === 'review-error')
+  const released = actions.findIndex((a) => a[0] === 'remove-label' && a[1] === 'review-requested')
+  assert.ok(applied < released, `sticky label applied at ${applied}, trigger released at ${released}`)
+})
+
+test('a failure after the claim still ends with review-error and no trigger label', async () => {
+  const { deps, actions } = makeDeps({ runReview: async () => { throw new Error('verdict unparseable') } })
+  await runCycle({ config, deps, now: NOW })
+  assert.equal(named(actions, 'add-label', 'review-error').length, 1)
+  assert.equal(named(actions, 'add-label', 'review-requested').length, 0)
+})
+
+test('a benched PR that was re-requested is named in the log rather than ignored', async () => {
+  const { deps, logs } = makeDeps({
+    github: {
+      listOpenPrs: async () => [rawPr({ number: 7, labels: [{ name: 'review-requested' }, { name: 'review-error' }] })],
+    },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.deepEqual(out.processed, [], 'a PR carrying review-error is not reviewed')
+  const notice = logs.find((l) => /review-error/.test(l))
+  assert.ok(notice, `nothing told the operator why #7 was skipped:\n${logs.join('\n')}`)
+  assert.match(notice, /#7/)
+  assert.match(notice, /review-requested/, 'and it has to say what to do about it')
+})
+
 test('a failed PR stops wearing the in-review reaction', async () => {
   const { deps, actions } = makeDeps({ runReview: async () => { throw new Error('verdict unparseable') } })
   await runCycle({ config, deps, now: NOW })

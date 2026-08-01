@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { runCycle, REVIEW_FALLBACK_NOTE } from '../src/cycle.mjs'
 import { renderStateComment, emptyState, appendRound, parseState } from '../src/state.mjs'
 import { TransientError, FatalError } from '../src/github.mjs'
-import { ReviewTimeoutError } from '../src/review.mjs'
+import { ReviewTimeoutError, ReviewRunError } from '../src/review.mjs'
 
 const BOT = 'plat-reviewer[bot]'
 const NOW = '2026-07-29T18:00:00Z'
@@ -290,6 +290,53 @@ test('a usage limit inside the review is transient, not this PR\'s fault', async
   assert.equal(out.aborted, true)
   assert.ok(named(actions, 'add-label', 'review-requested').length === 1)
   assert.equal(named(actions, 'add-label', 'review-error').length, 0)
+  assert.equal(named(actions, 'review').length, 0)
+})
+
+test('a verdict from a run the CLI marked failed is never posted, and earns the sticky label', async () => {
+  // The dangerous shape: the run FAILED but its result still carries a
+  // well-formed verdict — error_max_turns, or a wrapper whose stdout is not the
+  // envelope at all. Parsed, it posts as an ordinary "## ✅ Approved" on code
+  // that was never fully reviewed, with an empty log.
+  // Constructed BEFORE the mock runs and type-asserted here. An earlier draft of
+  // this test used ReviewRunError without importing it: the mock threw
+  // ReferenceError, which carries no `.run` and is ALSO classified non-transient,
+  // so every assertion below passed while the behaviour under test was never
+  // exercised. The assertion is what makes that failure loud instead of green.
+  const failed = Object.assign(new ReviewRunError('claude reported a failed run'), {
+    run: { result: JSON.stringify(okVerdict()), isError: true, usage: {}, costUsd: 0.4, durationMs: 9, model: 'm' },
+  })
+  assert.ok(failed instanceof ReviewRunError, 'the test must throw a real ReviewRunError, not a ReferenceError')
+  assert.ok(failed.run, 'and it must carry the run classification reads')
+
+  const { deps, actions } = makeDeps({
+    runReview: async () => { throw Object.assign(failed, { runs: [failed.run] }) },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(named(actions, 'review').length, 0, 'nothing may be posted from a failed run')
+  assert.equal(named(actions, 'add-label', 'review-error').length, 1, 'permanent conditions get a human, not a retry loop')
+  assert.equal(named(actions, 'add-label', 'review-requested').length, 0, 'a broken install must not be retried against the operator\'s quota every cycle')
+  assert.equal(out.aborted, false)
+  assert.equal(out.processed[0].outcome, 'error')
+})
+
+// The other half of the classification, and the one the sticky-label test above
+// cannot prove: a ReviewRunError is NOT unconditionally permanent. A quota wall
+// arrives as an errored run too, and it is not this PR's fault and clears
+// itself, so it must re-queue rather than earn a label a human clears by hand.
+test('a ReviewRunError that is a quota wall stays transient, and is re-queued', async () => {
+  const limited = Object.assign(new ReviewRunError('claude reported a failed run'), {
+    run: { result: 'Claude AI usage limit reached|1799999999', isError: true, usage: {}, costUsd: 0, durationMs: 3, model: null },
+  })
+  assert.ok(limited instanceof ReviewRunError)
+
+  const { deps, actions } = makeDeps({
+    runReview: async () => { throw Object.assign(limited, { runs: [limited.run] }) },
+  })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(out.aborted, true, 'a quota wall stops the cycle rather than burning the rest of it')
+  assert.equal(named(actions, 'add-label', 'review-requested').length, 1, 'the trigger label is restored so the next cycle retries')
+  assert.equal(named(actions, 'add-label', 'review-error').length, 0, 'a wall that clears itself must not need a human')
   assert.equal(named(actions, 'review').length, 0)
 })
 

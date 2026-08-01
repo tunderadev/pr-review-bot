@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { Readable, Writable } from 'node:stream'
-import { buildReviewPrompt, parseVerdict, VerdictParseError, runClaude, isUsageLimit, runReview, ReviewTimeoutError, DEFAULT_REVIEW_TIMEOUT_MS, buildChildEnv, CHILD_ENV_ALLOWLIST } from '../src/review.mjs'
+import { buildReviewPrompt, parseVerdict, VerdictParseError, runClaude, isUsageLimit, runReview, ReviewTimeoutError, ReviewRunError, DEFAULT_REVIEW_TIMEOUT_MS, buildChildEnv, CHILD_ENV_ALLOWLIST } from '../src/review.mjs'
 
 const PR = { repo: 'o/r', number: 7, title: '[PLAT] add widget', author: 'octocat', headSha: 'abc1234', url: 'u' }
 
@@ -195,8 +195,8 @@ test('isUsageLimit detects quota exhaustion for the transient path', () => {
 })
 
 test('runReview retries an unparseable verdict exactly once, then throws', async () => {
-  const bad = { result: 'no json here', is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1 }
-  const good = { result: JSON.stringify(goodVerdict), is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const bad = { result: 'no json here', is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const good = { result: JSON.stringify(goodVerdict), is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0, duration_ms: 1 }
 
   const retried = fakeSpawn([bad, good])
   const ok = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: retried.impl })
@@ -212,8 +212,8 @@ test('runReview retries an unparseable verdict exactly once, then throws', async
 // implementation that the brief's own assertions above would have accepted.
 
 test('the retry prompt is the original plus a correction, not a rerun of the same words', async () => {
-  const bad = { result: 'Looks good to me!', is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1 }
-  const good = { result: JSON.stringify(goodVerdict), is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const bad = { result: 'Looks good to me!', is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const good = { result: JSON.stringify(goodVerdict), is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0, duration_ms: 1 }
   const { impl, seen } = fakeSpawn([bad, good])
 
   await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl })
@@ -226,7 +226,7 @@ test('the retry prompt is the original plus a correction, not a rerun of the sam
 })
 
 test('runReview retries once and then stops, rather than looping', async () => {
-  const bad = { result: 'still prose', is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const bad = { result: 'still prose', is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0, duration_ms: 1 }
   const { impl, seen } = fakeSpawn([bad, bad, bad, bad])
 
   await assert.rejects(runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl }), VerdictParseError)
@@ -234,7 +234,7 @@ test('runReview retries once and then stops, rather than looping', async () => {
 })
 
 test('runReview never infers approval from prose: an unparseable verdict yields no verdict at all', async () => {
-  const prose = { result: 'LGTM, ship it. No blocking issues.', is_error: false, usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const prose = { result: 'LGTM, ship it. No blocking issues.', is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0, duration_ms: 1 }
   const { impl } = fakeSpawn([prose, prose])
   await assert.rejects(
     runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl }),
@@ -257,10 +257,87 @@ test('a quota exhaustion is not charged to the PR: no retry, and the run is reco
     () => null,
     (e) => e,
   )
-  assert.ok(err instanceof VerdictParseError)
+  // A failed run, not a parse failure: nothing was wrong with the model's
+  // grammar, the run never happened. The class changed with the isError guard;
+  // everything that made this test worth having did not.
+  assert.ok(err instanceof ReviewRunError)
   assert.equal(seen.length, 1, 'a second call cannot beat a quota wall')
   assert.ok(err.run, 'the failing run travels with the error')
   assert.equal(isUsageLimit(err.run), true, 'the caller can take the transient path')
+})
+
+// ---------------------------------------------------------------------------
+// A verdict may never be derived from a run the tool itself marked failed.
+// runClaude computes isError deliberately, isUsageLimit consumes it, and
+// verify.mjs refuses point-blank to read a refutation verdict out of one — the
+// review path was the only place the invariant was not applied.
+// ---------------------------------------------------------------------------
+
+test('a run marked failed yields no verdict, even when its result is perfect JSON', async () => {
+  // error_max_turns: the model ran out of turns mid-review and the partial
+  // result still carries a well-formed verdict. Parsing it posts a review built
+  // on a review that did not finish.
+  const truncated = {
+    result: JSON.stringify(goodVerdict),
+    is_error: true,
+    subtype: 'error_max_turns',
+    usage: {},
+    total_cost_usd: 0.4,
+    duration_ms: 900,
+  }
+  const { impl, seen } = fakeSpawn([truncated, truncated])
+  const err = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl }).then(() => null, (e) => e)
+
+  assert.ok(err instanceof ReviewRunError, `a failed run must not produce a verdict, got ${err}`)
+  assert.ok(!('verdict' in err), 'no verdict may travel with it either')
+  assert.equal(seen.length, 1, 'a failed run is not beaten by asking again; the retry is for a formatting slip')
+  assert.equal(err.runs.length, 1, 'what it spent is still reported to telemetry')
+  assert.equal(isUsageLimit(err.run), false, 'not a quota event, so this is a per-PR failure and earns the sticky label')
+})
+
+test('stdout that is not the JSON envelope yields no verdict, however much JSON it contains', async () => {
+  // The whole-fleet failure: a `claude` shim on PATH, a wrapper, or a CLI
+  // output change. runClaude answers {result: <raw text>, isError: true} for
+  // anything it cannot parse as an envelope, so in this mode EVERY review is an
+  // errored run — and the model's fenced JSON was being lifted straight out of
+  // the raw text and posted as an ordinary "## ✅ Approved" with an empty log.
+  const raw = `Some wrapper preamble\n\`\`\`json\n${JSON.stringify(goodVerdict)}\n\`\`\`\n`
+  const { impl, seen } = fakeSpawn([raw, raw])
+  const err = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl }).then(() => null, (e) => e)
+
+  assert.ok(err instanceof ReviewRunError, `got ${err?.constructor?.name}: ${err?.message}`)
+  assert.equal(seen.length, 1)
+  assert.equal(isUsageLimit(err.run), false, 'a broken install is permanent — it must not be retried against the operator\'s quota forever')
+})
+
+test('the retry is still refused when it is the SECOND run that fails', async () => {
+  // The first attempt is a genuine formatting slip, so the retry is right; the
+  // retry then errors out. Guarding only the first run reads a verdict out of
+  // the second.
+  const slip = { result: 'Let me think about that.', is_error: false, subtype: 'success', usage: {}, total_cost_usd: 0.01, duration_ms: 5 }
+  const failed = { result: JSON.stringify(goodVerdict), is_error: true, subtype: 'error_during_execution', usage: {}, total_cost_usd: 0.02, duration_ms: 7 }
+  const { impl, seen } = fakeSpawn([slip, failed])
+  const err = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: impl }).then(() => null, (e) => e)
+
+  assert.ok(err instanceof ReviewRunError)
+  assert.equal(seen.length, 2, 'the slip earned its retry')
+  assert.deepEqual(err.runs.map((r) => r.costUsd), [0.01, 0.02], 'both attempts are still reported')
+})
+
+test('an errored run whose text names a quota wall stays transient', async () => {
+  // The one errored run that must NOT earn the sticky label: it is not this
+  // PR's fault and it clears itself. Classification still runs off the attached
+  // run, exactly as before.
+  const limited = { result: 'Claude AI usage limit reached|1799999999', is_error: true, subtype: 'error_during_execution', usage: {}, total_cost_usd: 0, duration_ms: 1 }
+  const err = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: fakeSpawn([limited]).impl }).then(() => null, (e) => e)
+  assert.ok(err instanceof ReviewRunError)
+  assert.equal(isUsageLimit(err.run), true)
+})
+
+test('a successful run still parses, so the guard cannot be "refuse everything"', async () => {
+  const good = { subtype: 'success', is_error: false, result: JSON.stringify(goodVerdict), usage: {}, total_cost_usd: 0.03, duration_ms: 22 }
+  const out = await runReview({ criteria: 'c', pr: PR, diff: 'd', cwd: '/wt', spawnImpl: fakeSpawn([good]).impl })
+  assert.equal(out.verdict.findings.length, 2)
 })
 
 test('a retried review reports every run, so telemetry sees what the retry cost', async () => {

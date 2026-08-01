@@ -157,6 +157,32 @@ export const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60_000
 // exactly what the per-PR label is for.
 export class ReviewTimeoutError extends Error {}
 
+// A run the CLI itself reported as failed. NOT a VerdictParseError: nothing was
+// wrong with the model's grammar — the run did not happen, and its `result` is
+// whatever partial text or error prose was left behind. Deriving a verdict from
+// it is how a review nobody completed gets posted as an ordinary "✅ Approved".
+//
+// This is the same invariant verify.mjs already enforces on the refutation
+// (`if (run.isError) return … unverified`); the review path was the only place
+// it was not applied.
+//
+// Classification is deliberately left to the run, not to this type. An errored
+// run is a PER-PR failure and earns the sticky review-error label — a broken
+// `claude` install, a shim on PATH, a wrapper that changed its output, an
+// error_max_turns on a pathological diff are all either permanent or
+// PR-specific, and retrying a permanent condition every cycle spends the
+// operator's personal subscription quota forever with nobody watching. The one
+// exception is a quota wall, which isUsageLimit still recognises off the
+// attached run, exactly as before, and which stays transient.
+export class ReviewRunError extends Error {}
+
+// The result of a failed run is unbounded text the model wrote about a diff a
+// stranger controls; only enough of it to identify the failure travels in the
+// message, which lands in the operator's log.
+const summarizeFailure = (run) =>
+  `claude reported a failed run (subtype/exit ${run.exitCode ?? 'n/a'}); refusing to read a verdict out of it: ` +
+  `${String(run.result ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) || '(no output)'}`
+
 export function runClaude({ prompt, cwd, spawnImpl = spawn, timeoutMs = DEFAULT_REVIEW_TIMEOUT_MS, env = process.env }) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
@@ -241,18 +267,24 @@ export async function runReview({ criteria, pr, diff, previousBlockers, skippedF
       throw Object.assign(e, { runs })
     }
   }
+  // The guard, applied to EVERY attempt rather than only the first: a genuine
+  // formatting slip earns its retry, and the retry can itself come back errored.
+  // The run travels with the error either way, because that is what lets the
+  // caller tell a quota wall (transient, re-queued) from a broken install
+  // (per-PR, sticky label) without grepping anyone's prose.
+  const refuseFailedRun = (r) => {
+    if (r.isError) throw Object.assign(new ReviewRunError(summarizeFailure(r)), { run: r, runs })
+  }
+
   let run = await attempt(prompt)
+  refuseFailedRun(run)
   try {
     return { verdict: parseVerdict(run.result), run, runs }
   } catch (e) {
     if (!(e instanceof VerdictParseError)) throw Object.assign(e, { runs })
-    // A quota wall is not this PR's fault and a second call cannot climb it. The
-    // run travels with the error so the caller can restore the trigger label and
-    // retry next cycle, instead of applying the sticky error label a human has
-    // to clear by hand.
-    if (isUsageLimit(run)) throw Object.assign(e, { run, runs })
     const retry = `${prompt}\n\nYour previous response was not valid JSON. Respond with ONLY the JSON object described above.`
     run = await attempt(retry)
+    refuseFailedRun(run)
     try {
       return { verdict: parseVerdict(run.result), run, runs }
     } catch (e2) {

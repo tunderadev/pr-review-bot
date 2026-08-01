@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runCycle, REVIEW_FALLBACK_NOTE, DiscoveryError } from '../src/cycle.mjs'
 import { createCheckouts } from '../src/checkout.mjs'
-import { renderStateComment, emptyState, appendRound, parseState } from '../src/state.mjs'
+import { renderStateComment, emptyState, appendRound, parseState, noteDegradedAttempt, degradedAttempts } from '../src/state.mjs'
 import { TransientError, FatalError } from '../src/github.mjs'
 import { ReviewTimeoutError, ReviewRunError } from '../src/review.mjs'
 
@@ -207,6 +207,94 @@ test('degraded with no survivors never approves — it re-queues instead', async
   assert.ok(named(actions, 'remove-label', 'review-in-progress').length === 1)
   assert.equal(out.aborted, true)
   assert.equal(out.processed[0].outcome, 'error')
+})
+
+// ---------------------------------------------------------------------------
+// Degraded with no survivors, over and over
+//
+// Re-queuing is right for a condition that clears itself. It is wrong for a
+// broken `claude` install or a gateway that errors on every call: no review is
+// ever posted, so alreadyReviewedSha never fires, and the PR pays for a full
+// review plus its refutations every single cycle, forever, out of the
+// operator's own subscription — with the labels netting to zero, so nothing
+// anywhere says it is happening.
+// ---------------------------------------------------------------------------
+
+const degradedRefutation = async ({ findings }) => ({
+  survivors: [],
+  refuted: findings.filter((f) => f.severity === 'blocking').map((f) => ({
+    ...f, refutation: 'not verified: the refutation could not be completed', unverified: true,
+  })),
+  runs: [], degraded: true,
+})
+const degradedDeps = (over = {}) => makeDeps({
+  runReview: async () => ({ verdict: okVerdict({ findings: [blocking()] }), runs: [RUN] }),
+  refuteBlockers: degradedRefutation,
+  ...over,
+})
+const writtenState = (actions) => {
+  const comment = named(actions, 'update-comment')[0] ?? named(actions, 'comment')[0]
+  assert.ok(comment, 'nothing was written to the ledger')
+  return parseState(comment.at(-1))
+}
+
+test('a degraded attempt is counted in the ledger without erasing what the last round blocked on', async () => {
+  const { deps, actions } = degradedDeps({ github: { listIssueComments: async () => [stickyComment(priorState)] } })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(out.aborted, true, 'the first occurrence is still a retry')
+
+  const written = writtenState(actions)
+  assert.equal(degradedAttempts(written, 'abc1234'), 1)
+  // The whole reason failed rounds are not appended: previousBlockers is read
+  // from the last round, so an error round would make the next review forget
+  // what it blocked on and silently re-approve it.
+  assert.equal(written.rounds.length, 1, 'a round that produced no verdict is still not a round')
+  assert.deepEqual(written.rounds[0].blockers.map((b) => b.claim), ['unhandled null'])
+})
+
+test('a repeat degraded attempt is recorded even though nothing about Slack changed', async () => {
+  // By the second attempt the announcement already wears 👀, so the binding is
+  // reconciled to exactly what it already was. "The binding changed" was the
+  // only reason the failure path ever rewrote the ledger — under it the count
+  // restarts at one every cycle and the escalation never arrives.
+  const inReview = { ...priorState, slack: { channel: 'C1', ts: '111.222', stateEmoji: 'eyes' } }
+  const { deps, actions } = degradedDeps({
+    github: { listIssueComments: async () => [stickyComment(noteDegradedAttempt(inReview, 'abc1234'))] },
+  })
+  await runCycle({ config, deps, now: NOW })
+  assert.equal(named(actions, 'react-add').length, 0, 'the fixture must leave the Slack binding untouched')
+  assert.equal(named(actions, 'react-remove').length, 0)
+  assert.equal(degradedAttempts(writtenState(actions), 'abc1234'), 2)
+})
+
+test('a third consecutive degraded attempt at the same head is benched for a human', async () => {
+  const twice = noteDegradedAttempt(noteDegradedAttempt(priorState, 'abc1234'), 'abc1234')
+  const { deps, actions } = degradedDeps({ github: { listIssueComments: async () => [stickyComment(twice)] } })
+  const out = await runCycle({ config, deps, now: NOW })
+
+  assert.equal(named(actions, 'add-label', 'review-error').length, 1, 'a permanent condition has to reach a human')
+  assert.equal(named(actions, 'add-label', 'review-requested').length, 0, 'and must stop paying for a review every cycle')
+  assert.equal(out.aborted, false, 'this PR is benched; the rest of the queue is fine')
+  assert.equal(named(actions, 'review').length, 0, 'still nothing posted — the verdict is still unknown')
+  assert.equal(writtenState(actions).rounds.length, 1, 'the blocker history survives being benched')
+})
+
+test('the count is per head SHA: a new commit is a fresh start', async () => {
+  const twice = noteDegradedAttempt(noteDegradedAttempt(priorState, 'old999'), 'old999')
+  const { deps, actions } = degradedDeps({ github: { listIssueComments: async () => [stickyComment(twice)] } })
+  const out = await runCycle({ config, deps, now: NOW })
+  assert.equal(out.aborted, true, 'a push is new code and deserves its own attempts')
+  assert.equal(named(actions, 'add-label', 'review-error').length, 0)
+  assert.equal(degradedAttempts(writtenState(actions), 'abc1234'), 1)
+})
+
+test('a review that reaches a verdict clears the count', async () => {
+  const twice = noteDegradedAttempt(noteDegradedAttempt(priorState, 'abc1234'), 'abc1234')
+  const { deps, actions } = makeDeps({ github: { listIssueComments: async () => [stickyComment(twice)] } })
+  await runCycle({ config, deps, now: NOW })
+  const written = writtenState(actions)
+  assert.equal(degradedAttempts(written, 'abc1234'), 0, 'a working cycle must not inherit a stale streak')
+  assert.equal(written.rounds.length, 2)
 })
 
 test('same head SHA: no review, no tokens, label cleared, thread explains', async () => {

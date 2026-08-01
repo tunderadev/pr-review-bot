@@ -143,8 +143,44 @@ export function findSticky(comments, botLogin) {
   return comments.find((c) => c.user?.login === botLogin && (c.body || '').includes(MARKER)) || null
 }
 
+// ---------------------------------------------------------------------------
+// The degraded-attempt counter
+//
+// Some failures repeat forever: a broken `claude` install, a gateway that
+// errors on every call. Each one costs a full review plus its refutations, and
+// because nothing is ever posted, alreadyReviewedSha never fires and nothing
+// stops it. Counting the consecutive attempts is what lets that be escalated to
+// a human instead.
+//
+// It lives BESIDE the rounds, never as one. previousBlockers is read from the
+// last round, so appending an error round (blockers: []) would make the next
+// review forget every outstanding blocker and silently re-approve what it
+// already asked to be fixed. A field of its own records the count and leaves
+// the history exactly as it was.
+//
+// Keyed by head SHA because a push is new code: it deserves its own attempts,
+// and it is also the most likely thing to fix the problem.
+export function noteDegradedAttempt(state, sha) {
+  return { ...state, degraded: { sha, attempts: degradedAttempts(state, sha) + 1 } }
+}
+
+// Tolerant on purpose. The sticky comment is editable by anyone with write
+// access, and a throw out of here lands on the never-retried label.
+export function degradedAttempts(state, sha) {
+  const record = state?.degraded
+  if (!isObject(record) || record.sha !== sha) return 0
+  return Number.isInteger(record.attempts) && record.attempts > 0 ? record.attempts : 0
+}
+
 export function appendRound(state, round) {
-  return { ...state, rounds: [...state.rounds, { round: state.rounds.length + 1, ...round }] }
+  return {
+    ...state,
+    // A round is only appended when a verdict was actually reached, which is
+    // exactly what ends a run of failed attempts. Left behind, a stale count
+    // would bench the PR the first time it went degraded weeks later.
+    degraded: null,
+    rounds: [...state.rounds, { round: state.rounds.length + 1, ...round }],
+  }
 }
 
 export function alreadyReviewedSha(reviews, botLogin, sha) {

@@ -1,7 +1,10 @@
 import { selectPrs, prsBlockedByError } from './discover.mjs'
 import { TransientError, FatalError, isRetryableTransportCode } from './github.mjs'
 import { ReviewTimeoutError, isUsageLimit } from './review.mjs'
-import { emptyState, parseState, findSticky, renderStateComment, appendRound, alreadyReviewedSha, lastRound } from './state.mjs'
+import {
+  emptyState, parseState, findSticky, renderStateComment, appendRound, alreadyReviewedSha, lastRound,
+  noteDegradedAttempt, degradedAttempts,
+} from './state.mjs'
 import { planReactionChange, resolveMention } from './reactions.mjs'
 import {
   verdictToEvent, verdictName, renderReviewBody, renderAnnouncement,
@@ -19,6 +22,15 @@ export const REFUTATION_TIMEOUT_MS = 5 * 60_000
 // but a review of an unknown fraction of a PR that does not say so is a review
 // nobody can calibrate.
 export const TRUNCATION_NOTE = '(further files beyond the pagination cap — not retrieved)'
+
+// How many times the same head SHA may come back degraded-with-no-survivors
+// before the PR is benched for a human. Re-queuing is right for a condition
+// that clears itself and wrong for one that does not — a broken `claude`
+// install, a gateway erroring on every call — and the two are indistinguishable
+// from a single occurrence. Small, because every attempt costs a full review
+// plus its refutations out of the operator's own subscription; more than one,
+// because a genuinely transient wobble must not bench a healthy PR.
+export const MAX_DEGRADED_ATTEMPTS = 3
 
 // Discovery runs OUTSIDE the per-PR try, because there is no PR yet to label —
 // so whatever it throws leaves runCycle entirely. Left as a bare GitHub error
@@ -323,6 +335,11 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
     // Which model call is in flight, so a failure can still report its cost
     // under the right phase.
     let phase = null
+    // Set when the failure path has something of its own to persist — today,
+    // the degraded-attempt count. The Slack binding is not the only reason to
+    // rewrite the ledger any more, and a count that is not written down is a
+    // count that restarts at one every cycle.
+    let ledgerNeedsWrite = false
     try {
       const [reviews, comments] = await Promise.all([
         github.listReviews(pr.repo, pr.number),
@@ -418,9 +435,23 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       // none means the correct verdict is unknown, so nothing is posted and the
       // PR is re-queued exactly as for a usage limit.
       if (degraded && survivors.length === 0) {
-        throw new TransientError(
-          `refutation could not verify ${unverified.length} blocking finding(s) on ${ref} and none survived, so the correct verdict is unknown; nothing posted, re-queued for the next cycle`
-        )
+        // Counted in the ledger before either throw, because the catch below is
+        // what persists it — and the count is the only thing that can tell a
+        // wobble apart from a condition that will still be here next cycle.
+        state = noteDegradedAttempt(state, pr.headSha)
+        ledgerNeedsWrite = true
+        const attempts = degradedAttempts(state, pr.headSha)
+        const what = `refutation could not verify ${unverified.length} blocking finding(s) on ${ref} and none survived, so the correct verdict is unknown; nothing posted`
+        // Nothing here retries itself out of a broken install. Without this the
+        // PR pays for a review plus N refutations every cycle indefinitely,
+        // while the labels net to zero so nothing ever says it is happening.
+        if (attempts >= MAX_DEGRADED_ATTEMPTS) {
+          throw new FatalError(
+            `${what}. That is ${attempts} consecutive attempts at ${pr.headSha.slice(0, 7)}, so the cause is not clearing itself — ` +
+              `check that \`claude\` runs from the command line and that reviews are not hitting a wall. The PR is benched until a human clears the label.`
+          )
+        }
+        throw new TransientError(`${what}, re-queued for the next cycle (attempt ${attempts} of ${MAX_DEGRADED_ATTEMPTS})`)
       }
 
       const body = renderReviewBody({
@@ -492,9 +523,9 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       // lastRound(state).blockers, so an error round (blockers: []) would make
       // the NEXT review forget every outstanding blocker from the last real
       // round, and silently re-approve what it already asked to be fixed.
-      if (bindingChanged(binding, state.slack)) {
+      if (ledgerNeedsWrite || bindingChanged(binding, state.slack)) {
         await writeState({ github, pr, sticky, state: { ...state, slack: binding } })
-          .catch((e) => log(`Could not persist the Slack binding for ${ref}: ${e.message}`))
+          .catch((e) => log(`Could not persist the ledger for ${ref}: ${e.message}`))
       }
       processed.push({ repo: pr.repo, number: pr.number, outcome: 'error' })
       log(`${ref} ${transient ? 'deferred' : 'failed'}: ${error.message}`)

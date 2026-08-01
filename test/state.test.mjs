@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { parseState, renderStateComment, findSticky, appendRound, alreadyReviewedSha, emptyState, lastRound, STATE_VERSION } from '../src/state.mjs'
+import { parseState, renderStateComment, findSticky, appendRound, alreadyReviewedSha, emptyState, lastRound, noteDegradedAttempt, degradedAttempts, STATE_VERSION } from '../src/state.mjs'
 
 const state = {
   version: STATE_VERSION,
@@ -319,4 +319,51 @@ test('parseState terminates on a marker-dense body', () => {
   const run = spawnSync(process.execPath, ['--input-type=module', '--eval', script], { encoding: 'utf8', timeout: 10_000 })
   assert.equal(run.signal, null, `parseState did not terminate (killed by ${run.signal})`)
   assert.equal(run.status, 0, `child exited ${run.status}: ${run.stderr}`)
+})
+
+// ---------------------------------------------------------------------------
+// The degraded-attempt counter
+//
+// It lives beside the rounds rather than inside them on purpose: an error round
+// carries no blockers, and previousBlockers is read from the last round, so
+// appending one would make the next review forget everything it blocked on and
+// silently re-approve it. Counting in a field of its own is what lets a
+// permanent failure be counted without destroying the history.
+// ---------------------------------------------------------------------------
+
+test('counting a degraded attempt leaves every round, and its blockers, untouched', () => {
+  const before = appendRound(emptyState(), { sha: 'abc1234', verdict: 'changes_requested', at: '2026-07-29T18:00:00Z', blockers: [{ file: 'src/a.ts', line: 4, claim: 'unhandled null' }] })
+  const after = noteDegradedAttempt(before, 'def5678')
+  assert.deepEqual(after.rounds, before.rounds, 'the blocker history is the thing that must survive')
+  assert.equal(degradedAttempts(after, 'def5678'), 1)
+})
+
+test('the count is consecutive, per head SHA', () => {
+  const once = noteDegradedAttempt(emptyState(), 'abc1234')
+  const twice = noteDegradedAttempt(once, 'abc1234')
+  assert.equal(degradedAttempts(twice, 'abc1234'), 2)
+  assert.equal(degradedAttempts(twice, 'other99'), 0, 'a different head is a different question')
+  assert.equal(degradedAttempts(noteDegradedAttempt(twice, 'other99'), 'other99'), 1, 'a push resets the streak')
+})
+
+test('a round that produced a verdict ends the streak', () => {
+  const stuck = noteDegradedAttempt(noteDegradedAttempt(emptyState(), 'abc1234'), 'abc1234')
+  const recovered = appendRound(stuck, { sha: 'abc1234', verdict: 'approved', at: '2026-07-29T18:00:00Z', blockers: [] })
+  assert.equal(degradedAttempts(recovered, 'abc1234'), 0)
+})
+
+test('the counter survives a round-trip through the sticky comment', () => {
+  const state = noteDegradedAttempt(emptyState(), 'abc1234')
+  assert.equal(degradedAttempts(parseState(renderStateComment(state)), 'abc1234'), 1)
+})
+
+test('a damaged counter reads as zero rather than throwing', () => {
+  // The sticky comment is editable by anyone with write access, and a throw here
+  // lands on the never-retried label.
+  for (const bad of [null, undefined, 'three', 42, {}, { sha: 'abc1234' }, { sha: 'abc1234', attempts: 'lots' }, { attempts: 2 }]) {
+    assert.equal(degradedAttempts({ ...emptyState(), degraded: bad }, 'abc1234'), 0, JSON.stringify(bad))
+  }
+  assert.equal(degradedAttempts(null, 'abc1234'), 0)
+  // …and a damaged one is replaced, not added to.
+  assert.equal(degradedAttempts(noteDegradedAttempt({ ...emptyState(), degraded: 'junk' }, 'abc1234'), 'abc1234'), 1)
 })

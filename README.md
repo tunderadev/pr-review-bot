@@ -8,6 +8,11 @@ webhook, no queue and no database. Every team runs its own copy with its own Git
 Slack app, its own channel, its own repo allowlist, its own title prefix and its own criteria file,
 so two teams sharing a monorepo never see each other's reviews.
 
+> **Setting this up somewhere new?** [`TESTING.md`](TESTING.md) covers standing it up on a second
+> machine or under a different GitHub account, and walking a sandbox PR end to end. Read §2 there
+> first if the GitHub account is changing — the bot recognises its own past work by an identity
+> derived from the App, so a different App reviews previously-reviewed PRs from scratch.
+
 ## 1. What it does
 
 ```

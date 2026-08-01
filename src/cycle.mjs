@@ -307,7 +307,10 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
   // and a per-repo one. Without the re-sort the first repo is served to
   // exhaustion before the second is looked at, so a repo that always has
   // maxPerCycle labelled PRs starves every repo listed after it, permanently.
-  candidates.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+  // String(), for the same reason selectPrs uses it: a payload with no
+  // updated_at would otherwise throw here, after every repo has been listed and
+  // before a single PR has been claimed.
+  candidates.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)))
 
   const selected = candidates.slice(0, config.maxPerCycle)
 
@@ -433,7 +436,12 @@ export async function runCycle({ config, deps, dryRun = false, now = new Date().
       // nobody looked at. Degraded WITH survivors is safe to post — requesting
       // changes on what was confirmed is still actionable — but degraded with
       // none means the correct verdict is unknown, so nothing is posted and the
-      // PR is re-queued exactly as for a usage limit.
+      // PR is re-queued exactly as for a usage limit — up to a point. Some
+      // causes never clear, and the count below is what finds them.
+      //
+      // The count deliberately survives the escalation: a human who clears the
+      // label without fixing the cause spends one more cycle discovering that,
+      // not another three. Reaching a verdict is what resets it.
       if (degraded && survivors.length === 0) {
         // Counted in the ledger before either throw, because the catch below is
         // what persists it — and the count is the only thing that can tell a

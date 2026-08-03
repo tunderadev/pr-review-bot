@@ -201,7 +201,7 @@ posts, nobody gets pinged.
 > `model` is **rejected** if present. Reviews inherit whatever model your Claude
 > CLI is set to; there is no pin.
 
-### 4.5 Install the plugin (optional, for `/pr-watch`)
+### 4.5 Install the plugin (optional, for `/pr-review-bot:pr-watch`)
 
 ```sh
 claude plugin marketplace add ~/code/pr-review-bot --scope local

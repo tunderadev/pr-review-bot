@@ -102,7 +102,7 @@ and Max plans cap Opus more tightly than overall usage.
 ## 4. Setup
 
 ```sh
-git clone https://github.com/philipj93/pr-review-bot.git ~/code/pr-review-bot
+git clone https://github.com/tunderadev/pr-review-bot.git ~/code/pr-review-bot
 cd ~/code/pr-review-bot
 npm test          # 405 tests, no network — proves the clone is sound
 ```

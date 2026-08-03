@@ -228,8 +228,8 @@ What lands in each:
 
 ## Limits
 
-Three things the pipeline assumes and does not enforce. All three are documented at length in the
-README's day-2 section.
+Three things the pipeline assumes and does not enforce. All three are documented at length in
+`docs/operating.md`.
 
 - **The ledger is editable by anyone with write access.** It is a plain GitHub comment. The parser
   refuses anything ambiguous and heals from empty, and the cheapest trigger is pasting the marker
